@@ -20,11 +20,11 @@ android {
     buildFeatures { prefab = true }   // kailangan para sa Oboe
 
     externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
+    cmake {
+        cppFlags += "-std=c++17"
+        arguments += "-DANDROID_STL=c++_shared"
     }
+}
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
