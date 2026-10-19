@@ -39,7 +39,7 @@ class OrganFolder(context: Context, private val treeUri: Uri) {
     }
 
     /** Hinahanap ang *.organ hanggang 2 level ng subfolder. */
-    fun findOrganFiles(): List<OrganRef> {
+    @Synchronized fun findOrganFiles(): List<OrganRef> {
         val found = ArrayList<OrganRef>()
         fun scan(dirId: String, depth: Int) {
             val kids = children(dirId).values
@@ -58,7 +58,7 @@ class OrganFolder(context: Context, private val treeUri: Uri) {
     }
 
     /** Ginagamit sa stage 2 para hanapin ang .wav/.wv ng isang pipe. Null kung wala. */
-    fun resolve(baseDirId: String, relPath: String): Uri? {
+    @Synchronized fun resolve(baseDirId: String, relPath: String): Uri? {
         val stack = arrayListOf(baseDirId)
         for (seg in relPath.replace('\\', '/').split('/')) {
             when (seg) {

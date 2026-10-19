@@ -8,11 +8,15 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 
@@ -20,12 +24,15 @@ class MainActivity : Activity(), MidiInputManager.Listener {
 
     private lateinit var statusView: TextView
     private lateinit var organInfo: TextView
+    private lateinit var memView: TextView
     private lateinit var stopsBox: LinearLayout
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
     private var midi: MidiInputManager? = null
-    private var folder: OrganFolder? = null
     private var organ: Organ? = null
+    @Volatile private var samples: SampleManager? = null
+    @Volatile private var activeManual: Manual? = null
+    private val sounding = arrayOfNulls<IntArray>(128)      // note -> pipe keys na tumutunog
     private val lines = ArrayDeque<String>()
     private val prefs by lazy { getSharedPreferences("organ", MODE_PRIVATE) }
 
@@ -37,7 +44,6 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             midi = MidiInputManager(this, this)
         } else onStatus("Walang MIDI support ang device na ito.")
 
-        // Buksan ulit ang huling organ folder (kung may persisted permission pa)
         prefs.getString(KEY_TREE, null)?.let {
             try { loadFolder(Uri.parse(it)) } catch (e: Exception) { Log.w(TAG, "restore failed", e) }
         }
@@ -84,7 +90,6 @@ class MainActivity : Activity(), MidiInputManager.Listener {
                 val f = OrganFolder(this, uri)
                 val files = f.findOrganFiles()
                 runOnUiThread {
-                    folder = f
                     when (files.size) {
                         0 -> onStatus("Walang .organ file sa folder na ito (na-extract na ba ang rar?)")
                         1 -> loadOrgan(f, files[0])
@@ -107,7 +112,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             try {
                 val text = OrganFolder.decode(f.readBytes(ref.docId))
                 val o = OdfParser.parse(text, ref.name.removeSuffix(".organ"))
-                runOnUiThread { showOrgan(o) }
+                runOnUiThread { showOrgan(o, f, ref) }
             } catch (e: Exception) {
                 Log.e(TAG, "loadOrgan", e)
                 onStatus("Error sa ODF: ${e.message}")
@@ -115,44 +120,101 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         }.start()
     }
 
-    private fun showOrgan(o: Organ) {
+    private fun label(s: Stop) = "${s.name}   [${s.pipeCount} pipes]"
+
+    private fun updateMem() {
+        memView.text = "Samples: ${AudioEngine.loadedCount()} naka-load (${AudioEngine.loadedBytes() / 1_048_576} MB)"
+    }
+
+    private fun showOrgan(o: Organ, f: OrganFolder, ref: OrganFolder.OrganRef) {
+        samples?.unloadAll()                       // alisin ang samples ng naunang organ
+        sounding.fill(null)
+        val sm = SampleManager(this, f, ref.baseDirId)
+        samples = sm
         organ = o
         stopsBox.removeAllViews()
+
         val stopCount = o.manuals.sumOf { it.stops.size }
-        val pipeCount = o.manuals.sumOf { m -> m.stops.sumOf { it.pipeCount } }
-        organInfo.text = "${o.name}\n${o.manuals.size} manual, $stopCount stops, $pipeCount pipes (naka-off lahat; walang sample na naka-load)"
+        organInfo.text = "${o.name}\n${o.manuals.size} manual, $stopCount stops (naka-off lahat; samples ng naka-on lang ang ilo-load)"
+        updateMem()
         onStatus("Nabasa: ${o.name}")
 
+        // Aling manual ang tutugtugin ng MIDI keyboard
+        val defaultIdx = o.manuals.indexOfFirst { !it.isPedal }.takeIf { it >= 0 } ?: 0
+        activeManual = o.manuals.getOrNull(defaultIdx)
+        stopsBox.addView(TextView(this).apply { text = "Tinutugtog ng MIDI keyboard:"; textSize = 13f })
+        stopsBox.addView(Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                o.manuals.map { (if (it.isPedal) "Pedal: " else "") + it.name }
+            )
+            setSelection(defaultIdx)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                    activeManual = o.manuals[pos]
+                    log("Manual: ${o.manuals[pos].name}")
+                }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+        })
+
         for (m in o.manuals) {
+            val visible = m.stops.filter { !it.name.contains("noise", ignoreCase = true) }
             stopsBox.addView(TextView(this).apply {
-                text = (if (m.isPedal) "PEDAL: " else "") + m.name + "  (${m.stops.size} stops)"
+                text = (if (m.isPedal) "PEDAL: " else "") + m.name + "  (${visible.size} stops)"
                 textSize = 15f; setTypeface(typeface, Typeface.BOLD)
                 setPadding(0, dp(12), 0, dp(4))
             })
-            for (s in m.stops) {
+            for (s in visible) {
                 stopsBox.addView(Switch(this).apply {
-                    text = "${s.name}   [${s.pipeCount} pipes]"
+                    text = label(s)
                     isChecked = s.enabled
-                    setOnCheckedChangeListener { _, on -> onStopToggled(m, s, on) }
+                    setOnCheckedChangeListener { btn, on -> onStopToggled(sm, btn as Switch, m, s, on) }
                 })
             }
         }
     }
 
-    /** Dito sa stage 2 ilo-load/i-u-unload ang samples ng stop (lazy loading). */
-    private fun onStopToggled(m: Manual, s: Stop, on: Boolean) {
+    /** Lazy loading: samples ng stop ay ilo-load lang kapag in-on, at i-u-unload kapag in-off. */
+    private fun onStopToggled(sm: SampleManager, btn: Switch, m: Manual, s: Stop, on: Boolean) {
         s.enabled = on
-        log("STOP ${if (on) "ON " else "OFF"} ${m.name}: ${s.name}")
+        if (on) {
+            btn.text = label(s) + "  ...naglo-load"
+            val t0 = System.currentTimeMillis()
+            sm.acquire(s) { loaded, failed ->
+                runOnUiThread {
+                    btn.text = label(s) + if (failed > 0) "  ($failed hindi na-load)" else ""
+                    updateMem()
+                    log("STOP ON  ${m.name}: ${s.name} -> $loaded samples, $failed failed, ${System.currentTimeMillis() - t0} ms")
+                }
+            }
+        } else {
+            sm.release(s)
+            btn.text = label(s)
+            updateMem()
+            log("STOP OFF ${m.name}: ${s.name}")
+        }
     }
 
     // ---------------- MIDI callbacks (MIDI thread) ----------------
 
     override fun onNoteOn(channel: Int, note: Int, velocity: Int, lagMs: Double) {
-        AudioEngine.noteOn(note, velocity)
+        val m = activeManual
+        val sm = samples
+        if (m != null && sm != null) {
+            sounding[note]?.let { old -> old.forEach { AudioEngine.pipeOff(it) } }
+            val keys = sm.keysForNote(m, note)
+            sounding[note] = keys
+            keys.forEach { AudioEngine.pipeOn(it, velocity) }
+        } else {
+            AudioEngine.noteOn(note, velocity)      // walang organ na naka-load: wavetable test sound
+        }
         log("NOTE ON  ch=${channel + 1} note=$note vel=$velocity lag=${fmt(lagMs)}")
     }
 
     override fun onNoteOff(channel: Int, note: Int, velocity: Int, lagMs: Double) {
+        sounding[note]?.let { keys -> keys.forEach { AudioEngine.pipeOff(it) } }
+        sounding[note] = null
         AudioEngine.noteOff(note)
         log("NOTE OFF ch=${channel + 1} note=$note lag=${fmt(lagMs)}")
     }
@@ -195,6 +257,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
         organInfo = TextView(this).apply { textSize = 13f; text = "Wala pang organ na naka-load." }
+        memView = TextView(this).apply { textSize = 12f }
         stopsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val stopsScroll = ScrollView(this).apply { addView(stopsBox) }
 
@@ -204,6 +267,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         root.addView(statusView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(buttons, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(organInfo, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(memView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(stopsScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(130)))
         setContentView(root)
