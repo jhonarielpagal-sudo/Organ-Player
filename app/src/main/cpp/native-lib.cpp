@@ -49,11 +49,11 @@ public:
             LOGE("requestStart failed: %s", oboe::convertToText(r));
             return false;
         }
-        LOGI("Audio started: %d Hz, burst=%d, buffer=%d frames (~%.1f ms), mmap=%d",
+        LOGI("Audio started: %d Hz, burst=%d, buffer=%d frames (~%.1f ms), api=%s",
              mStream->getSampleRate(), mStream->getFramesPerBurst(),
              mStream->getBufferSizeInFrames(),
              mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate(),
-             (int) mStream->isMMapUsed());
+             oboe::convertToText(mStream->getAudioApi()));
         return true;
     }
 
