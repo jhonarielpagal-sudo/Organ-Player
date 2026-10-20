@@ -1,27 +1,39 @@
 package com.example.organplayer
 
 import java.util.TreeMap
+import kotlin.math.pow
 
 // ---------------------------------------------------------------------------
-// Modelo ng organ (stage 1: structure lang, wala pang sample na naka-load)
+// Modelo ng organ
 // ---------------------------------------------------------------------------
 
-data class PipeDef(val path: String?, val releases: List<String>)
+/** tuneCents = PitchTuning + PitchCorrection (organ+rank+pipe). gainLinear = AmplitudeLevel x Gain. */
+data class PipeDef(
+    val path: String?, val releases: List<String>,
+    val tuneCents: Float = 0f, val gainLinear: Float = 1f
+)
 
 class Rank(val id: Int, val name: String, val firstMidiNote: Int, val pipes: List<PipeDef>)
 
-/** Reference ng isang Stop sa (bahagi ng) isang Rank. */
 class StopRank(val rank: Rank, val firstPipeNumber: Int, val pipeCount: Int, val firstAccessibleKey: Int)
 
 class Stop(val id: Int, val name: String, val ranks: List<StopRank>) {
-    /** Naka-off by default. Sa stage 2, sample ng enabled stops lang ang ilo-load. */
     @Volatile var enabled = false
     val pipeCount: Int get() = ranks.sumOf { it.pipeCount }
 }
 
+/** Coupler na nakasulat sa .organ. Ang may-ari (source) ay ang manual na naglilista nito. */
+class Coupler(
+    val id: Int, val name: String, val destManual: Int, val keyShift: Int,
+    val unisonOff: Boolean, defaultEngaged: Boolean
+) {
+    @Volatile var engaged = defaultEngaged
+}
+
 class Manual(
     val index: Int, val name: String, val isPedal: Boolean,
-    val numberOfKeys: Int, val firstMidiNote: Int, val stops: List<Stop>
+    val numberOfKeys: Int, val firstMidiNote: Int,
+    val stops: List<Stop>, val couplers: List<Coupler>
 )
 
 class Organ(val name: String, val manuals: List<Manual>)
@@ -33,6 +45,7 @@ class Organ(val name: String, val manuals: List<Manual>)
 class IniSection(private val map: Map<String, String>) {
     fun str(key: String): String? = map[key]?.takeIf { it.isNotEmpty() }
     fun int(key: String, def: Int): Int = map[key]?.trim()?.toIntOrNull() ?: def
+    fun float(key: String, def: Float): Float = map[key]?.trim()?.replace(',', '.')?.toFloatOrNull() ?: def
     fun bool(key: String, def: Boolean): Boolean = when (map[key]?.trim()?.uppercase()) {
         "Y", "YES", "TRUE", "1" -> true
         "N", "NO", "FALSE", "0" -> false
@@ -75,12 +88,25 @@ object IniParser {
 // ---------------------------------------------------------------------------
 
 object OdfParser {
+    private class Level(val cents: Float, val gain: Float) {
+        operator fun times(o: Level) = Level(cents + o.cents, gain * o.gain)
+    }
+
     private fun n3(i: Int) = i.toString().padStart(3, '0')
+
+    /** Pitch tuning (cents) at amplitude/gain na nakasulat sa isang section (prefix "" o "Pipe001"). */
+    private fun level(s: IniSection, prefix: String): Level {
+        val cents = s.float("${prefix}PitchTuning", 0f) + s.float("${prefix}PitchCorrection", 0f)
+        val amp = s.float("${prefix}AmplitudeLevel", 100f) / 100f
+        val db = s.float("${prefix}Gain", 0f)
+        return Level(cents.coerceIn(-1200f, 1200f), (amp * 10f.pow(db / 20f)).coerceIn(0f, 4f))
+    }
 
     fun parse(text: String, fallbackName: String): Organ {
         val ini = IniParser.parse(text)
         val org = ini["Organ"]
             ?: throw IllegalArgumentException("Walang [Organ] section - hindi ito GrandOrgue .organ file")
+        val organLevel = level(org, "")
 
         // 1) Mga Rank
         val ranks = HashMap<Int, Rank>()
@@ -89,11 +115,11 @@ object OdfParser {
             ranks[i] = Rank(
                 i, s.str("Name") ?: "Rank $i",
                 s.int("FirstMidiNoteNumber", 36),
-                parsePipes(s, s.int("NumberOfLogicalPipes", 0))
+                parsePipes(s, s.int("NumberOfLogicalPipes", 0), organLevel * level(s, ""))
             )
         }
 
-        // 2) Mga Manual (Manual000 = pedal kung HasPedals=Y; tolerant sa dalawang numbering)
+        // 2) Mga Manual (Manual000 = pedal kung HasPedals=Y)
         val hasPedals = org.bool("HasPedals", false)
         val manuals = ArrayList<Manual>()
         for (mi in 0..org.int("NumberOfManuals", 0)) {
@@ -102,27 +128,36 @@ object OdfParser {
             for (si in 1..s.int("NumberOfStops", 0)) {
                 val stopId = s.int("Stop${n3(si)}", 0)
                 val ss = ini["Stop${n3(stopId)}"] ?: continue
-                stops += parseStop(stopId, ss, ranks)
+                stops += parseStop(stopId, ss, ranks, organLevel)
+            }
+            val couplers = ArrayList<Coupler>()
+            for (ci in 1..s.int("NumberOfCouplers", 0)) {
+                val cid = s.int("Coupler${n3(ci)}", 0)
+                val cs = ini["Coupler${n3(cid)}"] ?: continue
+                couplers += Coupler(
+                    cid, cs.str("Name") ?: "Coupler $cid",
+                    cs.int("DestinationManual", mi), cs.int("DestinationKeyshift", 0),
+                    cs.bool("UnisonOff", false), cs.bool("DefaultToEngaged", false)
+                )
             }
             manuals += Manual(
                 mi, s.str("Name") ?: "Manual $mi", mi == 0 && hasPedals,
                 s.int("NumberOfLogicalKeys", 61),
                 s.int("FirstAccessibleKeyMIDINoteNumber", 36),
-                stops
+                stops, couplers
             )
         }
-        val name = org.str("ChurchName") ?: fallbackName
-        return Organ(name, manuals)
+        return Organ(org.str("ChurchName") ?: fallbackName, manuals)
     }
 
-    private fun parseStop(id: Int, s: IniSection, ranks: Map<Int, Rank>): Stop {
+    private fun parseStop(id: Int, s: IniSection, ranks: Map<Int, Rank>, organLevel: Level): Stop {
         val name = s.str("Name") ?: "Stop $id"
         val n = s.int("NumberOfRanks", 0)
         val refs = ArrayList<StopRank>()
         if (n == 0) {
-            // "inline" rank: ang mga Pipe ay nasa mismong [StopNNN] section
             val count = s.int("NumberOfLogicalPipes", 0)
-            val rank = Rank(-id, name, s.int("FirstMidiNoteNumber", 36), parsePipes(s, count))
+            val rank = Rank(-id, name, s.int("FirstMidiNoteNumber", 36),
+                parsePipes(s, count, organLevel * level(s, "")))
             refs += StopRank(
                 rank,
                 s.int("FirstAccessiblePipeLogicalPipeNumber", 1),
@@ -144,17 +179,18 @@ object OdfParser {
         return Stop(id, name, refs)
     }
 
-    private fun parsePipes(s: IniSection, count: Int): List<PipeDef> {
+    private fun parsePipes(s: IniSection, count: Int, base: Level): List<PipeDef> {
         val list = ArrayList<PipeDef>(count)
         for (i in 1..count) {
             val p = "Pipe${n3(i)}"
+            val lv = base * level(s, p)
             val releases = ArrayList<String>()
             var r = 1
             while (true) {
                 releases += s.str("${p}Release${n3(r)}") ?: break
                 r++
             }
-            list += PipeDef(s.str(p), releases)   // path ay maaaring "REF:..." - aayusin sa stage 2
+            list += PipeDef(s.str(p), releases, lv.cents, lv.gain)
         }
         return list
     }

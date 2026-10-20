@@ -7,9 +7,11 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -18,13 +20,15 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// WAV loading (PCM16/24/32 at float32; mono-mixdown sa int16; may 'smpl' loop)
+// WAV loading (PCM16/24/32 at float32; mono-mixdown sa int16; may 'smpl' loop at pitch)
 // ---------------------------------------------------------------------------
 struct Sample {
     std::vector<int16_t> data;
     int sampleRate = 44100;
     int loopStart = -1;
-    int loopEnd = -1;   // exclusive
+    int loopEnd = -1;        // exclusive
+    float pitchCents = 0.0f; // correction: ODF PitchTuning - paglihis ng sample sa pinakamalapit na ET note
+    float gain = 1.0f;       // AmplitudeLevel x Gain mula sa ODF
     bool hasLoop() const { return loopStart >= 0 && loopEnd > loopStart + 1; }
 };
 
@@ -46,14 +50,21 @@ static bool readAll(int fd, std::vector<uint8_t>& buf) {
     return !buf.empty();
 }
 
-static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b) {
-    if (b.size() < 44 || memcmp(b.data(), "RIFF", 4) != 0 || memcmp(b.data() + 8, "WAVE", 4) != 0)
+static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::string& err) {
+    char msg[128];
+    if (b.size() < 44 || memcmp(b.data(), "RIFF", 4) != 0 || memcmp(b.data() + 8, "WAVE", 4) != 0) {
+        char h[5] = {0, 0, 0, 0, 0};
+        for (int i = 0; i < 4 && i < (int) b.size(); ++i) h[i] = (b[i] >= 32 && b[i] < 127) ? (char) b[i] : '?';
+        snprintf(msg, sizeof(msg), "Hindi RIFF/WAVE ang file (header '%s', %zu bytes)", h, b.size());
+        err = msg;
         return nullptr;
+    }
     uint16_t fmtTag = 0, channels = 0, bits = 0;
     uint32_t rate = 0;
     const uint8_t* pcm = nullptr;
     size_t pcmBytes = 0;
     int64_t loopS = -1, loopE = -1;
+    uint32_t unity = 0, fraction = 0;
 
     size_t p = 12;
     while (p + 8 <= b.size()) {
@@ -71,23 +82,32 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b) {
         } else if (memcmp(c, "data", 4) == 0) {
             pcm = c + 8;
             pcmBytes = len;
-        } else if (memcmp(c, "smpl", 4) == 0 && len >= 60) {
-            if (rd32(c + 8 + 28) > 0) {
+        } else if (memcmp(c, "smpl", 4) == 0 && len >= 36) {
+            unity = rd32(c + 8 + 12);
+            fraction = rd32(c + 8 + 16);
+            if (len >= 60 && rd32(c + 8 + 28) > 0) {
                 loopS = rd32(c + 8 + 44);
                 loopE = (int64_t) rd32(c + 8 + 48) + 1;
             }
         }
         p = body + len + (sz & 1);
     }
-    if (!pcm || channels < 1 || rate == 0) return nullptr;
+    if (!pcm || channels < 1 || rate == 0) {
+        err = "Sira ang WAV: walang fmt/data chunk";
+        return nullptr;
+    }
     const bool isPcm = fmtTag == 1 && (bits == 16 || bits == 24 || bits == 32);
     const bool isFloat = fmtTag == 3 && bits == 32;
-    if (!isPcm && !isFloat) return nullptr;
+    if (!isPcm && !isFloat) {
+        snprintf(msg, sizeof(msg), "Hindi suportadong WAV format: tag=%u bits=%u ch=%u", fmtTag, bits, channels);
+        err = msg;
+        return nullptr;
+    }
 
     const size_t bytesPer = bits / 8;
     const size_t frameBytes = bytesPer * channels;
     const size_t frames = pcmBytes / frameBytes;
-    if (frames < 2) return nullptr;
+    if (frames < 2) { err = "Masyadong maikli ang WAV"; return nullptr; }
 
     auto s = std::make_shared<Sample>();
     s->data.resize(frames);
@@ -115,6 +135,12 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b) {
     if (loopS >= 0 && loopE > loopS + 1 && loopS < (int64_t) frames) {
         s->loopStart = (int) loopS;
         s->loopEnd = (int) std::min<int64_t>(loopE, (int64_t) frames);
+    }
+    // Pitch info ng sample: itutuwid sa pinakamalapit na equal-temperament note
+    if (unity > 0 || fraction > 0) {
+        const double semis = (double) unity + (double) fraction / 4294967296.0;
+        const double dev = (semis - std::round(semis)) * 100.0;   // cents (+ = masyadong mataas)
+        s->pitchCents = (float) -dev;
     }
     return s;
 }
@@ -149,18 +175,14 @@ public:
         mRelease = 1.0f - std::exp(-1.0f / (mSampleRate * 0.080f));
         mVoices.reserve(kMaxVoices);
 
-        mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * 2);
+        mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * mBursts.load());
 
         r = mStream->requestStart();
         if (r != oboe::Result::OK) {
             LOGE("requestStart failed: %s", oboe::convertToText(r));
             return false;
         }
-        LOGI("Audio started: %d Hz, burst=%d, buffer=%d frames (~%.1f ms), api=%s",
-             mStream->getSampleRate(), mStream->getFramesPerBurst(),
-             mStream->getBufferSizeInFrames(),
-             mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate(),
-             oboe::convertToText(mStream->getAudioApi()));
+        LOGI("Audio started: %s", infoLocked().c_str());
         return true;
     }
 
@@ -171,9 +193,35 @@ public:
             mStream->close();
             mStream.reset();
         }
-        mVoices.clear();                       // safe: stream na ay stopped
+        mVoices.clear();                       // safe: stopped na ang stream
         std::lock_guard<std::mutex> cl(mCmdLock);
         mPending.clear();
+    }
+
+    // ---- general settings ----
+    void setParams(float master, float attackMs, float releaseMs, float velSens,
+                   float globalCents, int maxVoices, int memCapMb) {
+        mMaster.store(std::max(0.0f, master));
+        mAttackMs.store(std::max(0.5f, attackMs));
+        mReleaseMs.store(std::max(5.0f, releaseMs));
+        mVelSens.store(std::min(1.0f, std::max(0.0f, velSens)));
+        mGlobalCents.store(globalCents);
+        mMaxVoices.store((size_t) std::max(8, std::min((int) kMaxVoices, maxVoices)));
+        mMaxBytes.store((size_t) std::max(32, memCapMb) * 1024u * 1024u);
+    }
+
+    float setBufferBursts(int n) {
+        n = std::max(1, std::min(16, n));
+        mBursts.store(n);
+        std::lock_guard<std::mutex> lock(mLock);
+        if (!mStream) return 0.0f;
+        mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * n);
+        return mStream->getBufferSizeInFrames() * 1000.0f / (float) mStream->getSampleRate();
+    }
+
+    std::string info() {
+        std::lock_guard<std::mutex> lock(mLock);
+        return infoLocked();
     }
 
     // ---- wavetable test voice ----
@@ -188,21 +236,25 @@ public:
     }
     void setTranspose(int semitones) { mTranspose.store(semitones); }
 
-    // ---- sample management (tinatawag mula sa loader threads) ----
-    bool loadSample(int key, int fd) {
+    // ---- sample management (loader threads) ----
+    // 0 = ok, 1 = hindi mabasa, 2 = hindi suportadong WAV, 3 = sobra sa memory cap
+    int loadSample(int key, int fd, float odfCents, float odfGain) {
         std::vector<uint8_t> buf;
         bool ok = readAll(fd, buf);
         close(fd);
-        if (!ok) return false;
-        std::shared_ptr<Sample> s = parseWav(buf);
+        if (!ok) { setError("Hindi mabasa ang file (read error o walang laman)"); return 1; }
+        std::string err;
+        std::shared_ptr<Sample> s = parseWav(buf, err);
         buf.clear();
         buf.shrink_to_fit();
-        if (!s) return false;
+        if (!s) { setError(err); return 2; }
+        s->pitchCents += odfCents;
+        s->gain = odfGain;
         const size_t bytes = s->data.size() * sizeof(int16_t);
         std::lock_guard<std::mutex> l(mSampleLock);
-        if (mLoadedBytes + bytes > kMaxBytes) {
-            LOGE("Memory cap reached, hindi na-load ang key %d", key);
-            return false;
+        if (mLoadedBytes + bytes > mMaxBytes.load()) {
+            setError("Sobra sa memory cap (taasan sa Settings)");
+            return 3;
         }
         auto it = mSamples.find(key);
         if (it != mSamples.end()) {
@@ -212,7 +264,7 @@ public:
             mSamples[key] = s;
         }
         mLoadedBytes += bytes;
-        return true;
+        return 0;
     }
 
     void unloadSample(int key) {
@@ -225,6 +277,8 @@ public:
 
     long long loadedBytes() { std::lock_guard<std::mutex> l(mSampleLock); return (long long) mLoadedBytes; }
     int loadedCount() { std::lock_guard<std::mutex> l(mSampleLock); return (int) mSamples.size(); }
+
+    std::string lastError() { std::lock_guard<std::mutex> l(mErrLock); return mLastError; }
 
     // ---- pipe trigger (MIDI thread) ----
     void pipeOn(int key, int velocity) {
@@ -261,9 +315,8 @@ public:
 private:
     static constexpr int kTableSize = 2048;
     static constexpr float kVoiceGain = 0.12f;
-    static constexpr size_t kMaxVoices = 256;
+    static constexpr size_t kMaxVoices = 512;
     static constexpr size_t kMaxPending = 4096;
-    static constexpr size_t kMaxBytes = 700u * 1024u * 1024u;   // ~700 MB cap
 
     struct Cmd { int type; int key; float vel; std::shared_ptr<const Sample> s; };
     struct Voice {
@@ -276,6 +329,18 @@ private:
         int key = 0;
     };
 
+    std::string infoLocked() {
+        if (!mStream) return "Naka-stop ang audio";
+        char buf[200];
+        snprintf(buf, sizeof(buf), "Audio: %s, %d Hz, burst %d, buffer %d frames (~%.1f ms)",
+                 oboe::convertToText(mStream->getAudioApi()), mStream->getSampleRate(),
+                 mStream->getFramesPerBurst(), mStream->getBufferSizeInFrames(),
+                 mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate());
+        return buf;
+    }
+
+    void setError(const std::string& e) { std::lock_guard<std::mutex> l(mErrLock); mLastError = e; }
+
     void pushCmd(Cmd c) {
         std::lock_guard<std::mutex> l(mCmdLock);
         if (mPending.size() < kMaxPending) mPending.push_back(std::move(c));
@@ -285,13 +350,17 @@ private:
         if (!mCmdLock.try_lock()) return;      // huwag mag-block sa audio thread
         mLocal.swap(mPending);
         mCmdLock.unlock();
+        const float sens = mVelSens.load(std::memory_order_relaxed);
+        const double gc = mGlobalCents.load(std::memory_order_relaxed);
+        const size_t maxV = mMaxVoices.load(std::memory_order_relaxed);
         for (auto& c : mLocal) {
             if (c.type == 0) {
-                if (mVoices.size() < kMaxVoices && c.s) {
+                if (mVoices.size() < maxV && c.s) {
                     Voice v;
                     v.s = std::move(c.s);
-                    v.ratio = static_cast<double>(v.s->sampleRate) / static_cast<double>(mSampleRate);
-                    v.gain = 0.35f + 0.65f * c.vel;
+                    v.ratio = (static_cast<double>(v.s->sampleRate) / static_cast<double>(mSampleRate))
+                              * std::exp2((static_cast<double>(v.s->pitchCents) + gc) / 1200.0);
+                    v.gain = (1.0f - sens * (1.0f - c.vel)) * v.s->gain;
                     v.key = c.key;
                     mVoices.push_back(std::move(v));
                 }
@@ -326,9 +395,9 @@ private:
     }
 
     void renderSamples(float* out, int numFrames) {
-        const float attackStep = 1.0f / (0.004f * mSampleRate);
-        const float releaseStep = 1.0f / (0.12f * mSampleRate);
-        constexpr float kMaster = 0.30f;
+        const float attackStep = 1.0f / (mAttackMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
+        const float releaseStep = 1.0f / (mReleaseMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
+        const float master = mMaster.load(std::memory_order_relaxed);
         for (size_t vi = 0; vi < mVoices.size();) {
             Voice& v = mVoices[vi];
             const Sample& s = *v.s;
@@ -349,7 +418,7 @@ private:
                 } else if (v.env < 1.0f) {
                     v.env = std::min(1.0f, v.env + attackStep);
                 }
-                out[i] += smp * v.env * v.gain * kMaster;
+                out[i] += smp * v.env * v.gain * master;
                 v.pos += v.ratio;
                 if (loop) {
                     const double len = static_cast<double>(s.loopEnd - s.loopStart);
@@ -385,6 +454,16 @@ private:
     std::vector<float> mTable;
     float mSampleRate = 48000.0f, mAttack = 0.01f, mRelease = 0.01f;
 
+    // settings
+    std::atomic<float> mMaster{0.30f};
+    std::atomic<float> mAttackMs{4.0f};
+    std::atomic<float> mReleaseMs{120.0f};
+    std::atomic<float> mVelSens{0.0f};
+    std::atomic<float> mGlobalCents{0.0f};
+    std::atomic<size_t> mMaxVoices{256};
+    std::atomic<size_t> mMaxBytes{700u * 1024u * 1024u};
+    std::atomic<int> mBursts{2};
+
     // wavetable test voice
     std::array<std::atomic<bool>, 128> mGate{};
     std::array<std::atomic<float>, 128> mVel{};
@@ -396,6 +475,8 @@ private:
     std::mutex mSampleLock;
     std::unordered_map<int, std::shared_ptr<const Sample>> mSamples;
     size_t mLoadedBytes = 0;
+    std::mutex mErrLock;
+    std::string mLastError;
 
     // MIDI thread -> audio thread
     std::mutex mCmdLock;
@@ -429,10 +510,11 @@ JNIEXPORT void JNICALL
 Java_com_example_organplayer_AudioEngine_nativeSetTranspose(JNIEnv*, jobject, jint semitones) {
     if (gEngine) gEngine->setTranspose(semitones);
 }
-JNIEXPORT jboolean JNICALL
-Java_com_example_organplayer_AudioEngine_nativeLoadSample(JNIEnv*, jobject, jint key, jint fd) {
-    if (!gEngine) { close(fd); return JNI_FALSE; }
-    return gEngine->loadSample(key, fd) ? JNI_TRUE : JNI_FALSE;
+JNIEXPORT jint JNICALL
+Java_com_example_organplayer_AudioEngine_nativeLoadSample(JNIEnv*, jobject, jint key, jint fd,
+                                                          jfloat tuneCents, jfloat gain) {
+    if (!gEngine) { close(fd); return 1; }
+    return gEngine->loadSample(key, fd, tuneCents, gain);
 }
 JNIEXPORT void JNICALL
 Java_com_example_organplayer_AudioEngine_nativeUnloadSample(JNIEnv*, jobject, jint key) {
@@ -453,6 +535,28 @@ Java_com_example_organplayer_AudioEngine_nativeLoadedBytes(JNIEnv*, jobject) {
 JNIEXPORT jint JNICALL
 Java_com_example_organplayer_AudioEngine_nativeLoadedCount(JNIEnv*, jobject) {
     return gEngine ? gEngine->loadedCount() : 0;
+}
+JNIEXPORT jstring JNICALL
+Java_com_example_organplayer_AudioEngine_nativeLastError(JNIEnv* env, jobject) {
+    std::string e = gEngine ? gEngine->lastError() : std::string("walang engine");
+    return env->NewStringUTF(e.c_str());
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetParams(JNIEnv*, jobject, jfloat master, jfloat attackMs,
+                                                         jfloat releaseMs, jfloat velSens, jfloat globalCents,
+                                                         jint maxVoices, jint memCapMb) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->setParams(master, attackMs, releaseMs, velSens, globalCents, maxVoices, memCapMb);
+}
+JNIEXPORT jfloat JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetBufferBursts(JNIEnv*, jobject, jint n) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    return gEngine->setBufferBursts(n);
+}
+JNIEXPORT jstring JNICALL
+Java_com_example_organplayer_AudioEngine_nativeInfo(JNIEnv* env, jobject) {
+    std::string e = gEngine ? gEngine->info() : std::string("Walang audio engine");
+    return env->NewStringUTF(e.c_str());
 }
 
 }  // extern "C"

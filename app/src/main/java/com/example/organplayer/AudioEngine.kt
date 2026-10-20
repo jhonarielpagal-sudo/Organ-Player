@@ -13,22 +13,36 @@ object AudioEngine {
     fun setTranspose(semitones: Int) = nativeSetTranspose(semitones)
 
     // Samples. Ang native ang magsasara ng fd (galing sa ParcelFileDescriptor.detachFd()).
-    fun loadSample(key: Int, fd: Int): Boolean = nativeLoadSample(key, fd)
+    // Return: 0 = ok, 1 = hindi mabasa, 2 = hindi suportadong WAV, 3 = sobra sa memory cap
+    fun loadSample(key: Int, fd: Int, tuneCents: Float, gain: Float): Int = nativeLoadSample(key, fd, tuneCents, gain)
     fun unloadSample(key: Int) = nativeUnloadSample(key)
     fun pipeOn(key: Int, velocity: Int) = nativePipeOn(key, velocity)
     fun pipeOff(key: Int) = nativePipeOff(key)
     fun loadedBytes(): Long = nativeLoadedBytes()
     fun loadedCount(): Int = nativeLoadedCount()
+    fun lastError(): String = nativeLastError()
+
+    // General settings
+    fun setParams(master: Float, attackMs: Float, releaseMs: Float, velSens: Float,
+                  globalCents: Float, maxVoices: Int, memCapMb: Int) =
+        nativeSetParams(master, attackMs, releaseMs, velSens, globalCents, maxVoices, memCapMb)
+    fun setBufferBursts(n: Int): Float = nativeSetBufferBursts(n)
+    fun info(): String = nativeInfo()
 
     private external fun nativeStart(): Boolean
     private external fun nativeStop()
     private external fun nativeNoteOn(note: Int, velocity: Int)
     private external fun nativeNoteOff(note: Int)
     private external fun nativeSetTranspose(semitones: Int)
-    private external fun nativeLoadSample(key: Int, fd: Int): Boolean
+    private external fun nativeLoadSample(key: Int, fd: Int, tuneCents: Float, gain: Float): Int
     private external fun nativeUnloadSample(key: Int)
     private external fun nativePipeOn(key: Int, velocity: Int)
     private external fun nativePipeOff(key: Int)
     private external fun nativeLoadedBytes(): Long
     private external fun nativeLoadedCount(): Int
+    private external fun nativeLastError(): String
+    private external fun nativeSetParams(master: Float, attackMs: Float, releaseMs: Float, velSens: Float,
+                                         globalCents: Float, maxVoices: Int, memCapMb: Int)
+    private external fun nativeSetBufferBursts(n: Int): Float
+    private external fun nativeInfo(): String
 }

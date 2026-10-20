@@ -1,65 +1,119 @@
 package com.example.organplayer
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Lazy loading ng samples: kapag in-on ang stop, ang samples lang ng stop na iyon ang ilo-load.
- * May reference count para sa mga rank na ginagamit ng higit sa isang stop.
+ * May reference count (shared ang rank/pipe sa mga stop na gumagamit ng REF).
  */
 class SampleManager(
     private val context: Context,
     private val folder: OrganFolder,
-    private val baseDirId: String
+    private val baseDirId: String,
+    private val organ: Organ,
+    private val settings: Settings
 ) {
+    class Report(
+        val loaded: Int, val failed: Int, val shared: Int, val unresolved: Int,
+        val reasons: String, val firstError: String?
+    )
+
+    private class Target(val key: Int, val pipe: PipeDef)
+
     private val pool = Executors.newFixedThreadPool(3)
     private val lock = Any()
     private val refs = HashMap<Int, Int>()
 
     fun pipeKey(rank: Rank, pipeNo: Int): Int = (rank.id + 100_000) * 1024 + pipeNo
 
-    /** (key, path) ng lahat ng pipe ng stop na may sariling WAV path. */
-    private fun pipesOf(stop: Stop): List<Pair<Int, String>> {
-        val out = LinkedHashMap<Int, String>()
+    /** Sinusundan ang "REF:manual:stop:pipe" papunta sa tunay na pipe na may WAV path. */
+    private fun target(rank: Rank, pipeNo: Int, depth: Int = 0): Target? {
+        val p = rank.pipes.getOrNull(pipeNo - 1) ?: return null
+        val path = p.path ?: return null
+        if (!path.startsWith("REF:", ignoreCase = true)) return Target(pipeKey(rank, pipeNo), p)
+        if (depth > 5) return null
+        val parts = path.substring(4).split(':')
+        if (parts.size < 3) return null
+        val m = parts[0].trim().toIntOrNull() ?: return null
+        val s = parts[1].trim().toIntOrNull() ?: return null
+        val n = parts[2].trim().toIntOrNull() ?: return null
+        val stop = organ.manuals.firstOrNull { it.index == m }?.stops?.getOrNull(s - 1) ?: return null
+        var remaining = n
         for (r in stop.ranks) {
-            for (i in 0 until r.pipeCount) {
-                val no = r.firstPipeNumber + i
-                val path = r.rank.pipes.getOrNull(no - 1)?.path ?: continue
-                if (path.startsWith("REF:", ignoreCase = true)) continue   // aayusin sa susunod
-                out[pipeKey(r.rank, no)] = path
-            }
+            if (remaining in 1..r.pipeCount) return target(r.rank, r.firstPipeNumber + remaining - 1, depth + 1)
+            remaining -= r.pipeCount
         }
-        return out.map { it.key to it.value }
+        return null
     }
 
-    fun acquire(stop: Stop, onDone: (loaded: Int, failed: Int) -> Unit) {
-        val toLoad = ArrayList<Pair<Int, String>>()
-        synchronized(lock) {
-            for (p in pipesOf(stop)) {
-                val n = (refs[p.first] ?: 0) + 1
-                refs[p.first] = n
-                if (n == 1) toLoad += p
+    /** Lahat ng natatanging pipe ng stop (key -> Target) at bilang ng hindi ma-resolve. */
+    private fun collect(stop: Stop): Pair<List<Target>, Int> {
+        val out = LinkedHashMap<Int, Target>()
+        var unresolved = 0
+        for (r in stop.ranks) {
+            for (i in 0 until r.pipeCount) {
+                val t = target(r.rank, r.firstPipeNumber + i)
+                if (t == null) unresolved++ else out[t.key] = t
             }
         }
-        if (toLoad.isEmpty()) { onDone(0, 0); return }
+        return out.values.toList() to unresolved
+    }
+
+    fun acquire(stop: Stop, onDone: (Report) -> Unit) {
+        val (targets, unresolved) = collect(stop)
+        val toLoad = ArrayList<Target>()
+        var shared = 0
+        synchronized(lock) {
+            for (t in targets) {
+                val n = (refs[t.key] ?: 0) + 1
+                refs[t.key] = n
+                if (n == 1) toLoad += t else shared++
+            }
+        }
+        if (toLoad.isEmpty()) { onDone(Report(0, 0, shared, unresolved, "", null)); return }
 
         val pending = AtomicInteger(toLoad.size)
         val failed = AtomicInteger(0)
-        for ((key, path) in toLoad) {
+        val notFound = AtomicInteger(0)
+        val openFail = AtomicInteger(0)
+        val badWav = AtomicInteger(0)
+        val other = AtomicInteger(0)
+        val firstError = AtomicReference<String?>(null)
+
+        for (t in toLoad) {
             pool.execute {
-                var ok = false
+                var code = 0
                 try {
-                    if (wanted(key)) {
-                        ok = loadFile(key, path)
-                        if (ok && !wanted(key)) AudioEngine.unloadSample(key)   // na-off habang naglo-load
-                    } else ok = true
+                    if (wanted(t.key)) {
+                        code = loadFile(t, firstError)
+                        if (code == 0 && !wanted(t.key)) AudioEngine.unloadSample(t.key)   // na-off habang naglo-load
+                    }
                 } catch (e: Exception) {
-                    Log.w(TAG, "load failed: $path", e)
+                    Log.w(TAG, "load failed: ${t.pipe.path}", e)
+                    firstError.compareAndSet(null, "Exception: ${e.message}  [${t.pipe.path}]")
+                    code = 99
                 }
-                if (!ok) failed.incrementAndGet()
-                if (pending.decrementAndGet() == 0) onDone(toLoad.size - failed.get(), failed.get())
+                if (code != 0) {
+                    failed.incrementAndGet()
+                    when (code) {
+                        -1 -> notFound.incrementAndGet()
+                        -2 -> openFail.incrementAndGet()
+                        2 -> badWav.incrementAndGet()
+                        else -> other.incrementAndGet()
+                    }
+                }
+                if (pending.decrementAndGet() == 0) {
+                    val reasons = listOf(
+                        "walang file" to notFound.get(), "hindi mabuksan" to openFail.get(),
+                        "hindi suportadong WAV" to badWav.get(), "iba pa" to other.get()
+                    ).filter { it.second > 0 }.joinToString(", ") { "${it.first}: ${it.second}" }
+                    onDone(Report(toLoad.size - failed.get(), failed.get(), shared, unresolved, reasons, firstError.get()))
+                }
             }
         }
     }
@@ -67,9 +121,9 @@ class SampleManager(
     fun release(stop: Stop) {
         val dead = ArrayList<Int>()
         synchronized(lock) {
-            for (p in pipesOf(stop)) {
-                val n = (refs[p.first] ?: 0) - 1
-                if (n <= 0) { refs.remove(p.first); dead += p.first } else refs[p.first] = n
+            for (t in collect(stop).first) {
+                val n = (refs[t.key] ?: 0) - 1
+                if (n <= 0) { refs.remove(t.key); dead += t.key } else refs[t.key] = n
             }
         }
         dead.forEach { AudioEngine.unloadSample(it) }
@@ -81,29 +135,65 @@ class SampleManager(
         pool.shutdownNow()
     }
 
-    /** Mga key ng pipe na tutunog kapag pinindot ang MIDI note sa manual na ito (enabled stops lang). */
-    fun keysForNote(manual: Manual, note: Int): IntArray {
+    /** Mga key ng pipe na tutunog sa manual na ito para sa note (enabled stops lang). */
+    private fun keysForNote(manual: Manual, note: Int): List<Int> {
         val k = note - manual.firstMidiNote + 1          // logical key number (1-based)
         val out = ArrayList<Int>()
         for (s in manual.stops) {
             if (!s.enabled) continue
             for (r in s.ranks) {
                 if (k < r.firstAccessibleKey || k >= r.firstAccessibleKey + r.pipeCount) continue
-                val no = r.firstPipeNumber + (k - r.firstAccessibleKey)
-                val path = r.rank.pipes.getOrNull(no - 1)?.path ?: continue
-                if (path.startsWith("REF:", ignoreCase = true)) continue
-                out += pipeKey(r.rank, no)
+                val t = target(r.rank, r.firstPipeNumber + (k - r.firstAccessibleKey)) ?: continue
+                out += t.key
             }
         }
+        return out
+    }
+
+    /** Pinindot na note sa source manual: unison (kung hindi naka-off) + mga naka-engage na coupler. */
+    fun keysForPlayedNote(src: Manual, note: Int): IntArray {
+        val t = settings.transpose
+        val out = LinkedHashSet<Int>()
+        var unison = true
+        for (c in src.couplers) {
+            if (!c.engaged) continue
+            if (c.unisonOff) { unison = false; continue }
+            val dest = organ.manuals.firstOrNull { it.index == c.destManual } ?: continue
+            out.addAll(keysForNote(dest, note + c.keyShift + t))
+        }
+        if (unison) out.addAll(keysForNote(src, note + t))
         return out.toIntArray()
     }
 
     private fun wanted(key: Int) = synchronized(lock) { (refs[key] ?: 0) > 0 }
 
-    private fun loadFile(key: Int, path: String): Boolean {
-        val uri = folder.resolve(baseDirId, path) ?: run { Log.w(TAG, "wala ang file: $path"); return false }
-        val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return false
-        return AudioEngine.loadSample(key, pfd.detachFd())   // native ang magsasara ng fd
+    /** Hinahanap ang file: base dir, pagkatapos root ng folder, pagkatapos tinatanggal ang mga unang segment. */
+    private fun findFile(path: String): Uri? {
+        val segs = path.replace('\\', '/').split('/').filter { it.isNotEmpty() && it != "." }
+        for (skip in 0..minOf(3, segs.size - 1)) {
+            val rel = segs.drop(skip).joinToString("/")
+            folder.resolve(baseDirId, rel)?.let { return it }
+            folder.resolve(folder.rootId, rel)?.let { return it }
+        }
+        return null
+    }
+
+    /** 0 = ok, -1 = walang file, -2 = hindi mabuksan, iba = code mula sa native */
+    private fun loadFile(t: Target, firstError: AtomicReference<String?>): Int {
+        val path = t.pipe.path ?: return -1
+        val uri = findFile(path)
+        if (uri == null) {
+            firstError.compareAndSet(null, "Walang file: $path")
+            return -1
+        }
+        val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
+        if (pfd == null) {
+            firstError.compareAndSet(null, "Hindi mabuksan: $path")
+            return -2
+        }
+        val code = AudioEngine.loadSample(t.key, pfd.detachFd(), t.pipe.tuneCents, t.pipe.gainLinear)
+        if (code != 0) firstError.compareAndSet(null, "${AudioEngine.lastError()}  [$path]")
+        return code
     }
 
     companion object { private const val TAG = "OrganSamples" }
