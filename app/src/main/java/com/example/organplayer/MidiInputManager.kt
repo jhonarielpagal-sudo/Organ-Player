@@ -20,6 +20,8 @@ class MidiInputManager(context: Context, private val listener: Listener) {
         // Tinatawag sa MIDI thread (hindi UI thread) para mababa ang latency.
         fun onNoteOn(channel: Int, note: Int, velocity: Int, lagMs: Double)
         fun onNoteOff(channel: Int, note: Int, velocity: Int, lagMs: Double)
+        fun onControlChange(channel: Int, controller: Int, value: Int)
+        fun onProgramChange(channel: Int, program: Int)
         // Tinatawag sa main thread.
         fun onStatus(message: String)
     }
@@ -124,6 +126,8 @@ class MidiInputManager(context: Context, private val listener: Listener) {
                     0x90 -> if (d2 > 0) listener.onNoteOn(ch, d1, d2, lagMs)
                             else listener.onNoteOff(ch, d1, 0, lagMs)   // Note On vel 0 = Note Off
                     0x80 -> listener.onNoteOff(ch, d1, d2, lagMs)
+                    0xB0 -> listener.onControlChange(ch, d1, d2)
+                    0xC0 -> listener.onProgramChange(ch, d1)
                 }
             }
         }

@@ -16,8 +16,15 @@ object AudioEngine {
     // Return: 0 = ok, 1 = hindi mabasa, 2 = hindi suportadong WAV, 3 = sobra sa memory cap
     fun loadSample(key: Int, fd: Int, tuneCents: Float, gain: Float): Int = nativeLoadSample(key, fd, tuneCents, gain)
     fun unloadSample(key: Int) = nativeUnloadSample(key)
-    fun pipeOn(key: Int, velocity: Int) = nativePipeOn(key, velocity)
+    fun pipeOn(key: Int, velocity: Int, tremMask: Int) = nativePipeOn(key, velocity, tremMask)
     fun pipeOff(key: Int) = nativePipeOff(key)
+    fun panic() = nativePanic()
+
+    // Tremulant slots (0..31): amplitude + bahagyang pitch wobble
+    fun setTremulant(slot: Int, on: Boolean, periodMs: Float, depthPct: Float, startMs: Float, stopMs: Float) =
+        nativeSetTremulant(slot, on, periodMs, depthPct, startMs, stopMs)
+    fun clearTremulants() = nativeClearTremulants()
+
     fun loadedBytes(): Long = nativeLoadedBytes()
     fun loadedCount(): Int = nativeLoadedCount()
     fun lastError(): String = nativeLastError()
@@ -36,7 +43,10 @@ object AudioEngine {
     private external fun nativeSetTranspose(semitones: Int)
     private external fun nativeLoadSample(key: Int, fd: Int, tuneCents: Float, gain: Float): Int
     private external fun nativeUnloadSample(key: Int)
-    private external fun nativePipeOn(key: Int, velocity: Int)
+    private external fun nativePipeOn(key: Int, velocity: Int, tremMask: Int)
+    private external fun nativePanic()
+    private external fun nativeSetTremulant(slot: Int, on: Boolean, periodMs: Float, depthPct: Float, startMs: Float, stopMs: Float)
+    private external fun nativeClearTremulants()
     private external fun nativePipeOff(key: Int)
     private external fun nativeLoadedBytes(): Long
     private external fun nativeLoadedCount(): Int

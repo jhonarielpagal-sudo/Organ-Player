@@ -4,50 +4,47 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 
+/** Settings: i-type na lang ang numero (o gamitin ang - / +). */
 object SettingsDialog {
     fun show(act: Activity, s: Settings) {
-        val pad = (16 * act.resources.displayMetrics.density).toInt()
+        val pad = UiKit.dp(act, 16)
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
         val info = TextView(act).apply { textSize = 12f; text = AudioEngine.info() }
         box.addView(info)
+        val fields = ArrayList<NumberField>()
 
-        fun slider(label: String, min: Int, max: Int, value: Int, fmt: (Int) -> String, onChange: (Int) -> Unit) {
-            val tv = TextView(act).apply { text = "$label: ${fmt(value)}"; setPadding(0, pad, 0, 0) }
-            val sb = SeekBar(act).apply { this.max = max - min; progress = value - min }
-            sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar?, p: Int, fromUser: Boolean) {
-                    val v = p + min
-                    tv.text = "$label: ${fmt(v)}"
-                    if (fromUser) onChange(v)
-                }
-                override fun onStartTrackingTouch(bar: SeekBar?) {}
-                override fun onStopTrackingTouch(bar: SeekBar?) { info.text = AudioEngine.info() }
+        fun field(label: String, min: Int, max: Int, unit: String, value: Int, step: Int = 1, onChange: (Int) -> Unit) {
+            val f = NumberField(act, label, min, max, unit, value, step) { v ->
+                onChange(v); s.applyToEngine(); info.text = AudioEngine.info()
+            }
+            fields += f
+            box.addView(f, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = UiKit.dp(act, 10)
             })
-            box.addView(tv)
-            box.addView(sb)
         }
 
-        slider("Master volume", 0, 100, s.masterVolume, { "$it%" }) { s.masterVolume = it; s.applyToEngine() }
-        slider("Audio buffer", 1, 8, s.bufferBursts, { "$it burst" }) { s.bufferBursts = it; s.applyToEngine() }
-        slider("Attack", 1, 100, s.attackMs, { "$it ms" }) { s.attackMs = it; s.applyToEngine() }
-        slider("Release", 10, 3000, s.releaseMs, { "$it ms" }) { s.releaseMs = it; s.applyToEngine() }
-        slider("Transpose", -12, 12, s.transpose, { if (it > 0) "+$it" else "$it" }) { s.transpose = it; s.applyToEngine() }
-        slider("Tuning (A4)", 415, 466, s.tuningA4, { "$it Hz" }) { s.tuningA4 = it; s.applyToEngine() }
-        slider("Velocity sensitivity", 0, 100, s.velocitySens, { "$it%" }) { s.velocitySens = it; s.applyToEngine() }
-        slider("Max na sabay na tunog", 16, 512, s.maxVoices, { "$it" }) { s.maxVoices = it; s.applyToEngine() }
-        slider("Memory cap (samples)", 100, 1500, s.memCapMb, { "$it MB" }) { s.memCapMb = it; s.applyToEngine() }
+        field("Master volume", 0, 100, "%", s.masterVolume, 5) { s.masterVolume = it }
+        field("Transpose", -12, 12, "semitone", s.transpose) { s.transpose = it }
+        field("Tuning (A4)", 415, 466, "Hz", s.tuningA4) { s.tuningA4 = it }
+        field("Audio buffer", 1, 8, "burst", s.bufferBursts) { s.bufferBursts = it }
+        field("Attack", 1, 100, "ms", s.attackMs) { s.attackMs = it }
+        field("Release", 10, 3000, "ms", s.releaseMs, 10) { s.releaseMs = it }
+        field("Velocity sensitivity", 0, 100, "%", s.velocitySens, 5) { s.velocitySens = it }
+        field("Max na sabay na tunog", 16, 512, "", s.maxVoices, 16) { s.maxVoices = it }
+        field("Memory cap (samples)", 100, 2000, "MB", s.memCapMb, 50) { s.memCapMb = it }
 
-        AlertDialog.Builder(act)
+        val dlg = AlertDialog.Builder(act)
             .setTitle("Settings")
             .setView(ScrollView(act).apply { addView(box) })
-            .setPositiveButton("OK", null)
-            .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine() }
-            .show()
+            .setPositiveButton("OK") { _, _ -> fields.forEach { it.commit() } }
+            .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine(); show(act, s) }
+            .create()
+        dlg.setOnDismissListener { fields.forEach { it.commit() } }
+        dlg.show()
     }
 }

@@ -135,34 +135,40 @@ class SampleManager(
         pool.shutdownNow()
     }
 
-    /** Mga key ng pipe na tutunog sa manual na ito para sa note (enabled stops lang). */
-    private fun keysForNote(manual: Manual, note: Int): List<Int> {
+    /** key = pipe key, masks = tremulant mask ng bawat pipe (parehong haba). */
+    class Hits(val keys: IntArray, val masks: IntArray)
+
+    private fun collectNote(manual: Manual, note: Int, out: LinkedHashMap<Int, Int>) {
         val k = note - manual.firstMidiNote + 1          // logical key number (1-based)
-        val out = ArrayList<Int>()
         for (s in manual.stops) {
-            if (!s.enabled) continue
+            if (!s.enabled) continue                      // naka-mute / naka-off
             for (r in s.ranks) {
                 if (k < r.firstAccessibleKey || k >= r.firstAccessibleKey + r.pipeCount) continue
                 val t = target(r.rank, r.firstPipeNumber + (k - r.firstAccessibleKey)) ?: continue
-                out += t.key
+                out[t.key] = (out[t.key] ?: 0) or r.rank.tremMask
             }
         }
-        return out
     }
 
-    /** Pinindot na note sa source manual: unison (kung hindi naka-off) + mga naka-engage na coupler. */
-    fun keysForPlayedNote(src: Manual, note: Int): IntArray {
+    private fun toHits(m: LinkedHashMap<Int, Int>) = Hits(m.keys.toIntArray(), m.values.toIntArray())
+
+    /** Mga pipe na tutunog sa manual na ito para sa eksaktong note (walang transpose/coupler). */
+    fun hitsForNote(manual: Manual, note: Int): Hits =
+        toHits(LinkedHashMap<Int, Int>().also { collectNote(manual, note, it) })
+
+    /** Pinindot na note: unison (kung hindi naka-off) + mga naka-engage na NORMAL coupler. Kasama ang transpose. */
+    fun normalHits(src: Manual, note: Int): Hits {
         val t = settings.transpose
-        val out = LinkedHashSet<Int>()
+        val out = LinkedHashMap<Int, Int>()
         var unison = true
         for (c in src.couplers) {
-            if (!c.engaged) continue
+            if (!c.engaged || c.kind != CouplerKind.NORMAL) continue
             if (c.unisonOff) { unison = false; continue }
             val dest = organ.manuals.firstOrNull { it.index == c.destManual } ?: continue
-            out.addAll(keysForNote(dest, note + c.keyShift + t))
+            collectNote(dest, note + c.keyShift + t, out)
         }
-        if (unison) out.addAll(keysForNote(src, note + t))
-        return out.toIntArray()
+        if (unison) collectNote(src, note + t, out)
+        return toHits(out)
     }
 
     private fun wanted(key: Int) = synchronized(lock) { (refs[key] ?: 0) > 0 }

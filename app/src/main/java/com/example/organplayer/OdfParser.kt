@@ -13,21 +13,36 @@ data class PipeDef(
     val tuneCents: Float = 0f, val gainLinear: Float = 1f
 )
 
-class Rank(val id: Int, val name: String, val firstMidiNote: Int, val pipes: List<PipeDef>)
+/** tremMask: bit n = apektado ng tremulant slot n (ayon sa windchest ng rank). */
+class Rank(val id: Int, val name: String, val firstMidiNote: Int, val pipes: List<PipeDef>, val tremMask: Int = 0)
 
 class StopRank(val rank: Rank, val firstPipeNumber: Int, val pipeCount: Int, val firstAccessibleKey: Int)
 
 class Stop(val id: Int, val name: String, val ranks: List<StopRank>) {
-    @Volatile var enabled = false
+    @Volatile var enabled = false        // tumutunog (hindi naka-mute)
+    @Volatile var loaded = false         // naka-load sa memory ang samples
+    @Volatile var manualIndex = -1
+    @Volatile var status = ""
+    val key: String get() = "$manualIndex.$id"
     val pipeCount: Int get() = ranks.sumOf { it.pipeCount }
 }
+
+enum class CouplerKind { NORMAL, MELODY, BASS }
 
 /** Coupler na nakasulat sa .organ. Ang may-ari (source) ay ang manual na naglilista nito. */
 class Coupler(
     val id: Int, val name: String, val destManual: Int, val keyShift: Int,
-    val unisonOff: Boolean, defaultEngaged: Boolean
+    val unisonOff: Boolean, defaultEngaged: Boolean, val kind: CouplerKind = CouplerKind.NORMAL
 ) {
     @Volatile var engaged = defaultEngaged
+}
+
+/** slot = 0..31 (bit sa tremMask). Synth tremulant: amplitude + bahagyang pitch wobble. */
+class Tremulant(
+    val id: Int, val name: String, val slot: Int, val periodMs: Float, val depthPct: Float,
+    val startRate: Int, val stopRate: Int, defaultOn: Boolean
+) {
+    @Volatile var on = defaultOn
 }
 
 class Manual(
@@ -36,7 +51,7 @@ class Manual(
     val stops: List<Stop>, val couplers: List<Coupler>
 )
 
-class Organ(val name: String, val manuals: List<Manual>)
+class Organ(val name: String, val manuals: List<Manual>, val tremulants: List<Tremulant> = emptyList())
 
 // ---------------------------------------------------------------------------
 // INI parser (case-insensitive sections at keys, gaya ng GrandOrgue)
@@ -108,6 +123,34 @@ object OdfParser {
             ?: throw IllegalArgumentException("Walang [Organ] section - hindi ito GrandOrgue .organ file")
         val organLevel = level(org, "")
 
+        // 0) Mga Tremulant at kung aling windchest ang apektado
+        val tremulants = ArrayList<Tremulant>()
+        val nTrem = minOf(32, org.int("NumberOfTremulants", 0))
+        for (i in 1..nTrem) {
+            val s = ini["Tremulant${n3(i)}"] ?: continue
+            val wave = s.str("Type")?.equals("Wave", ignoreCase = true) == true
+            tremulants += Tremulant(
+                i, s.str("Name") ?: "Tremulant $i", i - 1,
+                if (wave) 250f else s.float("Period", 250f).coerceIn(40f, 2000f),
+                if (wave) 10f else s.float("AmpModDepth", 10f).coerceIn(0f, 100f),
+                s.int("StartRate", 44), s.int("StopRate", 44), s.bool("DefaultToEngaged", false)
+            )
+        }
+        val chestMask = HashMap<Int, Int>()
+        for (w in 1..org.int("NumberOfWindchestGroups", 0)) {
+            val ws = ini["Windchest${n3(w)}"] ?: continue
+            var mask = 0
+            for (k in 1..ws.int("NumberOfTremulants", 0)) {
+                val tid = ws.int("Tremulant${n3(k)}", 0)
+                if (tid in 1..nTrem) mask = mask or (1 shl (tid - 1))
+            }
+            chestMask[w] = mask
+        }
+        val allMask = if (nTrem >= 32) -1 else (1 shl nTrem) - 1
+        // Kung walang windchest na nag-lista ng tremulant, lahat ng rank ang apektado
+        val anyRef = chestMask.values.any { it != 0 }
+        val maskOf = { chest: Int -> if (!anyRef) allMask else (chestMask[chest] ?: 0) }
+
         // 1) Mga Rank
         val ranks = HashMap<Int, Rank>()
         for (i in 1..org.int("NumberOfRanks", 0)) {
@@ -115,7 +158,8 @@ object OdfParser {
             ranks[i] = Rank(
                 i, s.str("Name") ?: "Rank $i",
                 s.int("FirstMidiNoteNumber", 36),
-                parsePipes(s, s.int("NumberOfLogicalPipes", 0), organLevel * level(s, ""))
+                parsePipes(s, s.int("NumberOfLogicalPipes", 0), organLevel * level(s, "")),
+                maskOf(s.int("WindchestGroup", 1))
             )
         }
 
@@ -128,16 +172,27 @@ object OdfParser {
             for (si in 1..s.int("NumberOfStops", 0)) {
                 val stopId = s.int("Stop${n3(si)}", 0)
                 val ss = ini["Stop${n3(stopId)}"] ?: continue
-                stops += parseStop(stopId, ss, ranks, organLevel)
+                stops += parseStop(stopId, ss, ranks, organLevel, maskOf).also { it.manualIndex = mi }
             }
             val couplers = ArrayList<Coupler>()
             for (ci in 1..s.int("NumberOfCouplers", 0)) {
                 val cid = s.int("Coupler${n3(ci)}", 0)
                 val cs = ini["Coupler${n3(cid)}"] ?: continue
+                val cname = cs.str("Name") ?: "Coupler $cid"
+                val kind = when (cs.str("CouplerType")?.trim()?.lowercase()) {
+                    "melody" -> CouplerKind.MELODY
+                    "bass" -> CouplerKind.BASS
+                    "normal" -> CouplerKind.NORMAL
+                    else -> when {      // walang CouplerType: hulaan sa pangalan
+                        Regex("\\bmelody\\b", RegexOption.IGNORE_CASE).containsMatchIn(cname) -> CouplerKind.MELODY
+                        Regex("\\bbass\\b", RegexOption.IGNORE_CASE).containsMatchIn(cname) -> CouplerKind.BASS
+                        else -> CouplerKind.NORMAL
+                    }
+                }
                 couplers += Coupler(
-                    cid, cs.str("Name") ?: "Coupler $cid",
+                    cid, cname,
                     cs.int("DestinationManual", mi), cs.int("DestinationKeyshift", 0),
-                    cs.bool("UnisonOff", false), cs.bool("DefaultToEngaged", false)
+                    cs.bool("UnisonOff", false), cs.bool("DefaultToEngaged", false), kind
                 )
             }
             manuals += Manual(
@@ -147,17 +202,19 @@ object OdfParser {
                 stops, couplers
             )
         }
-        return Organ(org.str("ChurchName") ?: fallbackName, manuals)
+        return Organ(org.str("ChurchName") ?: fallbackName, manuals, tremulants)
     }
 
-    private fun parseStop(id: Int, s: IniSection, ranks: Map<Int, Rank>, organLevel: Level): Stop {
+    private fun parseStop(
+        id: Int, s: IniSection, ranks: Map<Int, Rank>, organLevel: Level, maskOf: (Int) -> Int
+    ): Stop {
         val name = s.str("Name") ?: "Stop $id"
         val n = s.int("NumberOfRanks", 0)
         val refs = ArrayList<StopRank>()
         if (n == 0) {
             val count = s.int("NumberOfLogicalPipes", 0)
             val rank = Rank(-id, name, s.int("FirstMidiNoteNumber", 36),
-                parsePipes(s, count, organLevel * level(s, "")))
+                parsePipes(s, count, organLevel * level(s, "")), maskOf(s.int("WindchestGroup", 1)))
             refs += StopRank(
                 rank,
                 s.int("FirstAccessiblePipeLogicalPipeNumber", 1),

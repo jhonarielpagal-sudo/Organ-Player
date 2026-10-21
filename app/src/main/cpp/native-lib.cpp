@@ -174,6 +174,7 @@ public:
         mAttack  = 1.0f - std::exp(-1.0f / (mSampleRate * 0.010f));
         mRelease = 1.0f - std::exp(-1.0f / (mSampleRate * 0.080f));
         mVoices.reserve(kMaxVoices);
+        if (mTremBuf.empty()) mTremBuf.assign((size_t) kMaxTrem * 2 * kMaxFrames, 1.0f);
 
         mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * mBursts.load());
 
@@ -281,7 +282,7 @@ public:
     std::string lastError() { std::lock_guard<std::mutex> l(mErrLock); return mLastError; }
 
     // ---- pipe trigger (MIDI thread) ----
-    void pipeOn(int key, int velocity) {
+    void pipeOn(int key, int velocity, uint32_t tremMask) {
         std::shared_ptr<const Sample> s;
         {
             std::lock_guard<std::mutex> l(mSampleLock);
@@ -289,9 +290,26 @@ public:
             if (it == mSamples.end()) return;
             s = it->second;
         }
-        pushCmd({0, key, std::max(1, velocity) / 127.0f, std::move(s)});
+        pushCmd({0, key, std::max(1, velocity) / 127.0f, tremMask, std::move(s)});
     }
-    void pipeOff(int key) { pushCmd({1, key, 0.0f, nullptr}); }
+    void pipeOff(int key) { pushCmd({1, key, 0.0f, 0u, nullptr}); }
+    void panic() {
+        pushCmd({2, 0, 0.0f, 0u, nullptr});
+        for (int n = 0; n < 128; ++n) mGate[n].store(false, std::memory_order_release);
+    }
+
+    // ---- tremulants (slot 0..31) ----
+    void setTremulant(int slot, bool on, float periodMs, float depthPct, float startMs, float stopMs) {
+        if (slot < 0 || slot >= kMaxTrem) return;
+        mTremPeriod[slot].store(periodMs);
+        mTremDepth[slot].store(std::min(1.0f, std::max(0.0f, depthPct / 100.0f)));
+        mTremStart[slot].store(startMs);
+        mTremStop[slot].store(stopMs);
+        mTremOn[slot].store(on);
+    }
+    void clearTremulants() {
+        for (int t = 0; t < kMaxTrem; ++t) mTremOn[t].store(false);
+    }
 
     // ---- audio callback ----
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream*, void* audioData,
@@ -301,6 +319,7 @@ public:
 
         processCommands();
         renderWavetable(out, numFrames);
+        prepareTremulants(numFrames);
         renderSamples(out, numFrames);
 
         for (int i = 0; i < numFrames; ++i) out[i] = std::tanh(out[i]);   // soft limiter
@@ -317,8 +336,10 @@ private:
     static constexpr float kVoiceGain = 0.12f;
     static constexpr size_t kMaxVoices = 512;
     static constexpr size_t kMaxPending = 4096;
+    static constexpr int kMaxTrem = 32;
+    static constexpr int kMaxFrames = 4096;
 
-    struct Cmd { int type; int key; float vel; std::shared_ptr<const Sample> s; };
+    struct Cmd { int type; int key; float vel; uint32_t mask; std::shared_ptr<const Sample> s; };
     struct Voice {
         std::shared_ptr<const Sample> s;
         double pos = 0.0;
@@ -327,6 +348,7 @@ private:
         float env = 0.0f;
         bool releasing = false;
         int key = 0;
+        uint32_t tremMask = 0;
     };
 
     std::string infoLocked() {
@@ -362,10 +384,13 @@ private:
                               * std::exp2((static_cast<double>(v.s->pitchCents) + gc) / 1200.0);
                     v.gain = (1.0f - sens * (1.0f - c.vel)) * v.s->gain;
                     v.key = c.key;
+                    v.tremMask = c.mask;
                     mVoices.push_back(std::move(v));
                 }
-            } else {
+            } else if (c.type == 1) {
                 for (auto& v : mVoices) if (v.key == c.key) v.releasing = true;
+            } else {                                            // panic
+                for (auto& v : mVoices) v.releasing = true;
             }
         }
         mLocal.clear();
@@ -394,6 +419,37 @@ private:
         }
     }
 
+    // Kinakalkula ang amplitude/pitch multiplier ng bawat tremulant na aktibo para sa buong buffer.
+    void prepareTremulants(int numFrames) {
+        mTremActive = 0;
+        if (numFrames > kMaxFrames || mTremBuf.empty()) return;
+        const float sr = mSampleRate;
+        for (int t = 0; t < kMaxTrem; ++t) {
+            const bool on = mTremOn[t].load(std::memory_order_relaxed);
+            float level = mTremLevel[t];
+            if (!on && level <= 0.0f) continue;
+            const float depth = mTremDepth[t].load(std::memory_order_relaxed);
+            const float period = std::max(20.0f, mTremPeriod[t].load(std::memory_order_relaxed));
+            const float upStep = 1.0f / (std::max(1.0f, mTremStart[t].load(std::memory_order_relaxed)) * 0.001f * sr);
+            const float dnStep = 1.0f / (std::max(1.0f, mTremStop[t].load(std::memory_order_relaxed)) * 0.001f * sr);
+            const float dPhase = 1.0f / (period * 0.001f * sr);
+            float phase = mTremPhase[t];
+            float* amp = &mTremBuf[(size_t) (t * 2) * kMaxFrames];
+            float* pit = &mTremBuf[(size_t) (t * 2 + 1) * kMaxFrames];
+            for (int i = 0; i < numFrames; ++i) {
+                level = on ? std::min(1.0f, level + upStep) : std::max(0.0f, level - dnStep);
+                const float s = std::sin(6.2831853f * phase);
+                amp[i] = 1.0f + depth * level * 0.5f * s;
+                pit[i] = 1.0f + depth * level * 0.0087f * s;     // ~ +-15 cents sa 100% depth
+                phase += dPhase;
+                if (phase >= 1.0f) phase -= 1.0f;
+            }
+            mTremPhase[t] = phase;
+            mTremLevel[t] = level;
+            mTremActive |= (1u << t);
+        }
+    }
+
     void renderSamples(float* out, int numFrames) {
         const float attackStep = 1.0f / (mAttackMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
         const float releaseStep = 1.0f / (mReleaseMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
@@ -404,6 +460,7 @@ private:
             const int16_t* d = s.data.data();
             const int size = static_cast<int>(s.data.size());
             const bool loop = s.hasLoop();
+            const uint32_t tm = v.tremMask & mTremActive;
             bool done = false;
             for (int i = 0; i < numFrames; ++i) {
                 const int idx = static_cast<int>(v.pos);
@@ -418,8 +475,18 @@ private:
                 } else if (v.env < 1.0f) {
                     v.env = std::min(1.0f, v.env + attackStep);
                 }
-                out[i] += smp * v.env * v.gain * master;
-                v.pos += v.ratio;
+                float amp = 1.0f, pit = 1.0f;
+                if (tm) {
+                    uint32_t b = tm;
+                    while (b) {
+                        const int t = __builtin_ctz(b);
+                        b &= b - 1;
+                        amp *= mTremBuf[(size_t) (t * 2) * kMaxFrames + i];
+                        pit *= mTremBuf[(size_t) (t * 2 + 1) * kMaxFrames + i];
+                    }
+                }
+                out[i] += smp * v.env * v.gain * master * amp;
+                v.pos += v.ratio * pit;
                 if (loop) {
                     const double len = static_cast<double>(s.loopEnd - s.loopStart);
                     while (v.pos >= s.loopEnd) v.pos -= len;
@@ -463,6 +530,17 @@ private:
     std::atomic<size_t> mMaxVoices{256};
     std::atomic<size_t> mMaxBytes{700u * 1024u * 1024u};
     std::atomic<int> mBursts{2};
+
+    // tremulants
+    std::array<std::atomic<bool>, kMaxTrem> mTremOn{};
+    std::array<std::atomic<float>, kMaxTrem> mTremPeriod{};
+    std::array<std::atomic<float>, kMaxTrem> mTremDepth{};
+    std::array<std::atomic<float>, kMaxTrem> mTremStart{};
+    std::array<std::atomic<float>, kMaxTrem> mTremStop{};
+    std::array<float, kMaxTrem> mTremPhase{};     // audio thread lang
+    std::array<float, kMaxTrem> mTremLevel{};     // audio thread lang
+    std::vector<float> mTremBuf;                  // [slot*2] = amp, [slot*2+1] = pitch
+    uint32_t mTremActive = 0;
 
     // wavetable test voice
     std::array<std::atomic<bool>, 128> mGate{};
@@ -521,8 +599,23 @@ Java_com_example_organplayer_AudioEngine_nativeUnloadSample(JNIEnv*, jobject, ji
     if (gEngine) gEngine->unloadSample(key);
 }
 JNIEXPORT void JNICALL
-Java_com_example_organplayer_AudioEngine_nativePipeOn(JNIEnv*, jobject, jint key, jint velocity) {
-    if (gEngine) gEngine->pipeOn(key, velocity);
+Java_com_example_organplayer_AudioEngine_nativePipeOn(JNIEnv*, jobject, jint key, jint velocity, jint mask) {
+    if (gEngine) gEngine->pipeOn(key, velocity, (uint32_t) mask);
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativePanic(JNIEnv*, jobject) {
+    if (gEngine) gEngine->panic();
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetTremulant(JNIEnv*, jobject, jint slot, jboolean on,
+                                                            jfloat periodMs, jfloat depthPct,
+                                                            jfloat startMs, jfloat stopMs) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->setTremulant(slot, on != JNI_FALSE, periodMs, depthPct, startMs, stopMs);
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeClearTremulants(JNIEnv*, jobject) {
+    if (gEngine) gEngine->clearTremulants();
 }
 JNIEXPORT void JNICALL
 Java_com_example_organplayer_AudioEngine_nativePipeOff(JNIEnv*, jobject, jint key) {

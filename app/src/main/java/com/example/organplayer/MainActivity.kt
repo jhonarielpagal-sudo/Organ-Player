@@ -7,17 +7,17 @@ import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
-import android.widget.Switch
 import android.widget.TextView
 
 class MainActivity : Activity(), MidiInputManager.Listener {
@@ -25,23 +25,27 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     private lateinit var statusView: TextView
     private lateinit var organInfo: TextView
     private lateinit var memView: TextView
-    private lateinit var stopsBox: LinearLayout
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var manualSpinner: Spinner
+    private lateinit var transposeField: NumberField
+    private lateinit var volumeField: NumberField
     private lateinit var settings: Settings
+    private lateinit var c: OrganController
+    private val ui = Handler(Looper.getMainLooper())
     private var midi: MidiInputManager? = null
     private var folder: OrganFolder? = null
     private var organFiles: List<OrganFolder.OrganRef> = emptyList()
-    @Volatile private var samples: SampleManager? = null
-    @Volatile private var activeManual: Manual? = null
-    private val sounding = arrayOfNulls<IntArray>(128)      // note -> pipe keys na tumutunog
     private val lines = ArrayDeque<String>()
     private val prefs by lazy { getSharedPreferences("organ", MODE_PRIVATE) }
+    private var spinnerOrgan: Organ? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = Settings(this)
+        c = OrganController(this, settings, prefs, { log(it) }, { ui.post(it) })
         buildUi()
+        c.addListener { onStateChanged() }
 
         if (packageManager.hasSystemFeature(PackageManager.FEATURE_MIDI)) {
             midi = MidiInputManager(this, this)
@@ -61,6 +65,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
 
     override fun onStop() {
         midi?.stop()
+        c.performer.panic()
         AudioEngine.stop()
         super.onStop()
     }
@@ -143,133 +148,66 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         }.start()
     }
 
-    private fun label(s: Stop) = "${s.name}   [${s.pipeCount} pipes]"
-
-    private fun updateMem() {
-        memView.text = "Samples: ${AudioEngine.loadedCount()} naka-load (${AudioEngine.loadedBytes() / 1_048_576} MB)"
-    }
-
     private fun showOrgan(o: Organ, f: OrganFolder, ref: OrganFolder.OrganRef) {
-        samples?.unloadAll()                       // alisin ang samples ng naunang organ
-        sounding.fill(null)
-        val sm = SampleManager(this, f, ref.baseDirId, o, settings)
-        samples = sm
-        stopsBox.removeAllViews()
-
+        c.attach(o, f, ref, organId(ref))
         val stopCount = o.manuals.sumOf { it.stops.size }
         val couplerCount = o.manuals.sumOf { it.couplers.size }
-        organInfo.text = "${o.name}  (${ref.name})\n${o.manuals.size} manual, $stopCount stops, $couplerCount couplers (naka-off lahat; samples ng naka-on lang ang ilo-load)"
-        updateMem()
+        organInfo.text = "${o.name}\n${ref.name}  -  ${o.manuals.size} manual, $stopCount stops, " +
+            "$couplerCount couplers, ${o.tremulants.size} tremulants"
         onStatus("Nabasa: ${o.name}")
+        setupManualSpinner(o)
+        onStateChanged()
+    }
 
-        // Aling manual ang tutugtugin ng MIDI keyboard
-        val defaultIdx = o.manuals.indexOfFirst { !it.isPedal }.takeIf { it >= 0 } ?: 0
-        activeManual = o.manuals.getOrNull(defaultIdx)
-        stopsBox.addView(TextView(this).apply { text = "Tinutugtog ng MIDI keyboard:"; textSize = 13f })
-        stopsBox.addView(Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
-                o.manuals.map { (if (it.isPedal) "Pedal: " else "") + it.name }
-            )
-            setSelection(defaultIdx)
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                    activeManual = o.manuals[pos]
-                    log("Manual: ${o.manuals[pos].name}")
-                }
-                override fun onNothingSelected(p: AdapterView<*>?) {}
+    private fun setupManualSpinner(o: Organ) {
+        spinnerOrgan = o
+        manualSpinner.onItemSelectedListener = null
+        manualSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            o.manuals.map { (if (it.isPedal) "Pedal: " else "") + it.name }
+        )
+        val cur = o.manuals.indexOfFirst { it === c.performer.activeManual }.coerceAtLeast(0)
+        manualSpinner.setSelection(cur, false)
+        manualSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                val m = o.manuals[pos]
+                c.setActiveManual(m)
+                log("Manual: ${m.name}")
             }
-        })
-
-        for (m in o.manuals) {
-            val visible = m.stops.filter { !it.name.contains("noise", ignoreCase = true) }
-            stopsBox.addView(TextView(this).apply {
-                text = (if (m.isPedal) "PEDAL: " else "") + m.name + "  (${visible.size} stops)"
-                textSize = 15f; setTypeface(typeface, Typeface.BOLD)
-                setPadding(0, dp(12), 0, dp(4))
-            })
-            for (s in visible) {
-                stopsBox.addView(Switch(this).apply {
-                    text = label(s)
-                    isChecked = s.enabled
-                    setOnCheckedChangeListener { btn, on -> onStopToggled(sm, btn as Switch, m, s, on) }
-                })
-            }
-            if (m.couplers.isNotEmpty()) {
-                stopsBox.addView(TextView(this).apply {
-                    text = "Couplers ng ${m.name}"
-                    textSize = 13f; setTypeface(typeface, Typeface.ITALIC)
-                    setPadding(0, dp(8), 0, 0)
-                })
-                for (c in m.couplers) {
-                    val dest = o.manuals.firstOrNull { it.index == c.destManual }?.name ?: "#${c.destManual}"
-                    val desc = when {
-                        c.unisonOff -> "unison off"
-                        c.keyShift == 0 -> "-> $dest"
-                        else -> "-> $dest (${if (c.keyShift > 0) "+" else ""}${c.keyShift} semitones)"
-                    }
-                    stopsBox.addView(Switch(this).apply {
-                        text = "${c.name}   [$desc]"
-                        isChecked = c.engaged
-                        setOnCheckedChangeListener { _, on ->
-                            c.engaged = on
-                            log("COUPLER ${if (on) "ON " else "OFF"} ${m.name}: ${c.name}")
-                        }
-                    })
-                }
-            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
         }
     }
 
-    /** Lazy loading: samples ng stop ay ilo-load lang kapag in-on, at i-u-unload kapag in-off. */
-    private fun onStopToggled(sm: SampleManager, btn: Switch, m: Manual, s: Stop, on: Boolean) {
-        s.enabled = on
-        if (on) {
-            btn.text = label(s) + "  ...naglo-load"
-            val t0 = System.currentTimeMillis()
-            sm.acquire(s) { r ->
-                runOnUiThread {
-                    btn.text = label(s) + when {
-                        r.failed > 0 -> "  (${r.failed} hindi na-load)"
-                        r.unresolved > 0 -> "  (${r.unresolved} walang sample)"
-                        else -> ""
-                    }
-                    updateMem()
-                    log("STOP ON  ${m.name}: ${s.name} -> ${r.loaded} loaded, ${r.shared} shared, " +
-                        "${r.failed} failed, ${r.unresolved} walang path/REF, ${System.currentTimeMillis() - t0} ms")
-                    if (r.reasons.isNotEmpty()) log("  ! ${r.reasons}")
-                    r.firstError?.let { log("  ! $it") }
-                }
-            }
-        } else {
-            sm.release(s)
-            btn.text = label(s)
-            updateMem()
-            log("STOP OFF ${m.name}: ${s.name}")
-        }
+    /** Tinatawag kapag may nagbago (UI, MIDI, load). */
+    private fun onStateChanged() {
+        transposeField.setValue(settings.transpose)
+        volumeField.setValue(settings.masterVolume)
+        memView.text = "Samples: ${AudioEngine.loadedCount()} naka-load (${AudioEngine.loadedBytes() / 1_048_576} MB)"
     }
 
     // ---------------- MIDI callbacks (MIDI thread) ----------------
 
     override fun onNoteOn(channel: Int, note: Int, velocity: Int, lagMs: Double) {
-        val m = activeManual
-        val sm = samples
-        if (m != null && sm != null) {
-            sounding[note]?.let { old -> old.forEach { AudioEngine.pipeOff(it) } }
-            val keys = sm.keysForPlayedNote(m, note)     // unison + couplers + transpose
-            sounding[note] = keys
-            keys.forEach { AudioEngine.pipeOn(it, velocity) }
-        } else {
+        if (c.onMidi(MidiMap.NOTE, channel, note, velocity)) return
+        if (!c.performer.noteOn(channel, note, velocity)) {
             AudioEngine.noteOn(note, velocity)      // walang organ na naka-load: wavetable test sound
         }
         log("NOTE ON  ch=${channel + 1} note=$note vel=$velocity lag=${fmt(lagMs)}")
     }
 
     override fun onNoteOff(channel: Int, note: Int, velocity: Int, lagMs: Double) {
-        sounding[note]?.let { keys -> keys.forEach { AudioEngine.pipeOff(it) } }
-        sounding[note] = null
+        if (c.onMidi(MidiMap.NOTE, channel, note, 0)) return
+        c.performer.noteOff(channel, note)
         AudioEngine.noteOff(note)
         log("NOTE OFF ch=${channel + 1} note=$note lag=${fmt(lagMs)}")
+    }
+
+    override fun onControlChange(channel: Int, controller: Int, value: Int) {
+        c.onMidi(MidiMap.CC, channel, controller, value)
+    }
+
+    override fun onProgramChange(channel: Int, program: Int) {
+        c.onMidi(MidiMap.PC, channel, program, 0)
     }
 
     override fun onStatus(message: String) {
@@ -277,10 +215,10 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         Log.i(TAG, message)
     }
 
-    // ---------------- UI helpers ----------------
+    // ---------------- UI ----------------
 
     private fun fmt(lagMs: Double) = if (lagMs < 0) "n/a" else "%.2f ms".format(lagMs)
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = UiKit.dp(this, v)
 
     private fun log(line: String) {
         Log.d(TAG, line)
@@ -292,38 +230,56 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         }
     }
 
+    private fun buttonRow(vararg items: Pair<String, () -> Unit>) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        for ((t, a) in items) addView(UiKit.button(context, t, a), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+    }
+
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(32), dp(16), dp(8))
+            setPadding(dp(12), dp(28), dp(12), dp(8))
         }
-        statusView = TextView(this).apply { textSize = 14f; text = "Naghihintay ng MIDI device..." }
-        val row1 = LinearLayout(this).apply {
+        statusView = TextView(this).apply { textSize = 13f; text = "Naghihintay ng MIDI device..." }
+
+        val row1 = buttonRow(
+            "Organ folder" to { pickFolder() },
+            "Piliin ang .organ" to { chooseOrgan() },
+            "Settings" to { SettingsDialog.show(this, settings) }
+        )
+        val row2 = buttonRow(
+            "Stops" to { StopsPanel(this, c).show() },
+            "Presets" to { PresetsDialog.show(this, c) },
+            "MIDI map" to { MidiMapDialog.show(this, c) },
+            "Channels" to { ChannelMapDialog.show(this, c) }
+        )
+
+        // Maliit na quick panel: organ file, manual, transpose, master volume
+        organInfo = TextView(this).apply {
+            textSize = 13f; setTypeface(typeface, Typeface.BOLD)
+            text = "Wala pang organ na naka-load."
+            setOnClickListener { chooseOrgan() }
+        }
+        manualSpinner = Spinner(this)
+        val manualRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(Button(context).apply {
-                text = "Organ folder"
-                setOnClickListener { pickFolder() }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            addView(Button(context).apply {
-                text = "Piliin ang .organ"
-                setOnClickListener { chooseOrgan() }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(TextView(context).apply { text = "Manual:"; textSize = 14f }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            addView(manualSpinner, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
-        val row2 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(Button(context).apply {
-                text = "Settings"
-                setOnClickListener { SettingsDialog.show(this@MainActivity, settings) }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            addView(Button(context).apply {
-                text = "Test C4"
-                setOnClickListener { AudioEngine.noteOn(60, 100); postDelayed({ AudioEngine.noteOff(60) }, 500) }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        transposeField = NumberField(this, "Transpose", -12, 12, "st", settings.transpose) { v -> c.setTranspose(v) }
+        volumeField = NumberField(this, "Master volume", 0, 100, "%", settings.masterVolume, 5) { v -> c.setVolume(v) }
+        memView = TextView(this).apply { textSize = 11f }
+        val quick = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setBackgroundColor(0x11000000)
+            addView(organInfo)
+            addView(manualRow)
+            addView(transposeField)
+            addView(volumeField)
+            addView(memView)
         }
-        organInfo = TextView(this).apply { textSize = 13f; text = "Wala pang organ na naka-load." }
-        memView = TextView(this).apply { textSize = 12f }
-        stopsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val stopsScroll = ScrollView(this).apply { addView(stopsBox) }
+        val panicRow = buttonRow("PANIC (All Notes Off)" to { c.panic() })
 
         logView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f; setTextIsSelectable(true) }
         logScroll = ScrollView(this).apply { addView(logView) }
@@ -331,10 +287,9 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         root.addView(statusView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(row1, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(organInfo, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(memView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(stopsScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(150)))
+        root.addView(quick, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) })
+        root.addView(panicRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
     }
 
