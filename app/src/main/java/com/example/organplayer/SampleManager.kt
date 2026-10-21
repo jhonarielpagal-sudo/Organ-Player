@@ -135,31 +135,39 @@ class SampleManager(
         pool.shutdownNow()
     }
 
-    /** key = pipe key, masks = tremulant mask ng bawat pipe (parehong haba). */
-    class Hits(val keys: IntArray, val masks: IntArray)
+    /** One sounding pipe with its per-stop adjustments. id = unique per (pipe sample, stop). */
+    class PipeInfo(
+        val key: Int, val mask: Int, val tag: Int, val group: Int,
+        val gain: Float, val cents: Float, val relMs: Float
+    ) {
+        val id: Long = (key.toLong() shl 32) or (tag.toLong() and 0xffffffffL)
+    }
 
-    private fun collectNote(manual: Manual, note: Int, out: LinkedHashMap<Int, Int>) {
+    class Hits(val pipes: List<PipeInfo>)
+
+    private fun collectNote(manual: Manual, note: Int, out: LinkedHashMap<Long, PipeInfo>) {
         val k = note - manual.firstMidiNote + 1          // logical key number (1-based)
         for (s in manual.stops) {
-            if (!s.enabled || !s.ready) continue            // muted / off / still loading
+            if (!s.enabled || !s.ready) continue          // muted / off / still loading
+            val gain = s.gainPct / 100f
+            val cents = (s.tuneCents + (s.pipeCents[note] ?: 0)).toFloat()
             for (r in s.ranks) {
                 if (k < r.firstAccessibleKey || k >= r.firstAccessibleKey + r.pipeCount) continue
                 val t = target(r.rank, r.firstPipeNumber + (k - r.firstAccessibleKey)) ?: continue
-                out[t.key] = (out[t.key] ?: 0) or r.rank.tremMask
+                val p = PipeInfo(t.key, r.rank.tremMask, s.tag, minOf(15, manual.index), gain, cents, s.releaseMs.toFloat())
+                if (!out.containsKey(p.id)) out[p.id] = p
             }
         }
     }
 
-    private fun toHits(m: LinkedHashMap<Int, Int>) = Hits(m.keys.toIntArray(), m.values.toIntArray())
-
-    /** Mga pipe na tutunog sa manual na ito para sa eksaktong note (walang transpose/coupler). */
+    /** Pipes for the exact note on this manual (no transpose / coupler). */
     fun hitsForNote(manual: Manual, note: Int): Hits =
-        toHits(LinkedHashMap<Int, Int>().also { collectNote(manual, note, it) })
+        Hits(LinkedHashMap<Long, PipeInfo>().also { collectNote(manual, note, it) }.values.toList())
 
-    /** Pinindot na note: unison (kung hindi naka-off) + mga naka-engage na NORMAL coupler. Kasama ang transpose. */
+    /** Played note: unison (unless off) + engaged NORMAL couplers. Includes transpose. */
     fun normalHits(src: Manual, note: Int): Hits {
         val t = settings.transpose
-        val out = LinkedHashMap<Int, Int>()
+        val out = LinkedHashMap<Long, PipeInfo>()
         var unison = true
         for (c in src.couplers) {
             if (!c.engaged || c.kind != CouplerKind.NORMAL) continue
@@ -168,7 +176,7 @@ class SampleManager(
             collectNote(dest, note + c.keyShift + t, out)
         }
         if (unison) collectNote(src, note + t, out)
-        return toHits(out)
+        return Hits(out.values.toList())
     }
 
     private fun wanted(key: Int) = synchronized(lock) { (refs[key] ?: 0) > 0 }

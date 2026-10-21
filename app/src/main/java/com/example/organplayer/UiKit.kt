@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -15,7 +16,22 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 object UiKit {
+    const val AMBER = 0xFFFFB300.toInt()          // "ON" indicator colour (yellow-orange)
+
     fun dp(ctx: Context, v: Int) = (v * ctx.resources.displayMetrics.density).toInt()
+
+    fun shape(ctx: Context, fill: Int, stroke: Int, radiusDp: Int, strokeDp: Int = 1) = GradientDrawable().apply {
+        setColor(fill)
+        cornerRadius = dp(ctx, radiusDp).toFloat()
+        setStroke(dp(ctx, strokeDp), stroke)
+    }
+
+    /** Lights a button amber (selected / on) or returns it to a neutral look. */
+    fun setLit(b: TextView, lit: Boolean, dark: Boolean = false) {
+        val off = if (dark) 0xFF23262D.toInt() else 0xFFE0E0E0.toInt()
+        b.background = shape(b.context, if (lit) AMBER else off, if (lit) 0xFFFFD54F.toInt() else 0x33000000, 8)
+        b.setTextColor(if (lit) 0xFF1A1200.toInt() else if (dark) 0xFFC9CED6.toInt() else 0xFF111111.toInt())
+    }
 
     fun button(ctx: Context, text: String, onClick: () -> Unit) = Button(ctx).apply {
         this.text = text
@@ -106,10 +122,10 @@ object MidiLearn {
     fun show(act: Activity, c: OrganController, action: String, title: String) {
         c.midiMap.learning = action
         val dlg = AlertDialog.Builder(act)
-            .setTitle("MIDI mapping")
-            .setMessage("$title\n\nPress a key, piston or knob on your MIDI device to assign it.")
-            .setNeutralButton("Clear mapping") { _, _ -> c.midiMap.clear(action) }
-            .setNegativeButton("Cancel", null)
+            .setTitle(tr("MIDI mapping", "MIDI mapping"))
+            .setMessage("$title\n\n" + tr("Press a key, piston or knob on your MIDI device to assign it.", "Pindutin ang key, piston o knob sa MIDI device para i-assign dito."))
+            .setNeutralButton(tr("Clear mapping", "Burahin ang mapping")) { _, _ -> c.midiMap.clear(action) }
+            .setNegativeButton(tr("Cancel", "Kanselahin"), null)
             .create()
         c.midiMap.onLearned = { dlg.dismiss() }
         dlg.setOnDismissListener {

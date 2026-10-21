@@ -37,7 +37,7 @@ class MidiInputManager(context: Context, private val listener: Listener) {
         override fun onDeviceAdded(info: MidiDeviceInfo) = openDevice(info)
         override fun onDeviceRemoved(info: MidiDeviceInfo) {
             closeDevice(info.id)
-            listener.onStatus("Removed: ${nameOf(info)}")
+            listener.onStatus(tr("Removed: ", "Natanggal: ") + "${nameOf(info)}")
         }
     }
 
@@ -45,7 +45,7 @@ class MidiInputManager(context: Context, private val listener: Listener) {
     fun start() {
         midiManager.registerDeviceCallback(deviceCallback, handler)
         midiManager.devices.forEach { openDevice(it) }   // mga nakasaksak na bago mag-launch
-        if (midiManager.devices.isEmpty()) listener.onStatus("No MIDI device. Plug in a keyboard (OTG).")
+        if (midiManager.devices.isEmpty()) listener.onStatus(tr("No MIDI device. Plug in a keyboard (OTG).", "Walang MIDI device. Isaksak ang keyboard (OTG)."))
     }
 
     fun stop() {
@@ -63,23 +63,23 @@ class MidiInputManager(context: Context, private val listener: Listener) {
         midiManager.openDevice(info, MidiManager.OnDeviceOpenedListener { device ->
             pending.remove(info.id)
             if (device == null) {
-                listener.onStatus("Cannot open: $name")
+                listener.onStatus(tr("Cannot open: ", "Hindi mabuksan: ") + name)
             } else {
                 try {
                     val port = device.openOutputPort(0)
                     if (port == null) {
                         device.close()
-                        listener.onStatus("No available port: $name")
+                        listener.onStatus(tr("No available port: ", "Walang available na port: ") + name)
                     } else {
                         val receiver = NoteReceiver()
                         port.connect(receiver)
                         open[info.id] = OpenDevice(device, port, receiver)
-                        listener.onStatus("Connected: $name")
+                        listener.onStatus(tr("Connected: ", "Nakakonekta: ") + name)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "openOutputPort failed", e)
                     device.close()
-                    listener.onStatus("Error on $name: ${e.message}")
+                    listener.onStatus(tr("Error on ", "Error sa ") + "$name: ${e.message}")
                 }
             }
         }, handler)

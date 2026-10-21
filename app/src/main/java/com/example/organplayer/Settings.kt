@@ -30,10 +30,31 @@ class Settings(context: Context) {
     @Volatile var memCapMb: Int = p.getInt("memcap", 700)
         set(v) { field = v; p.edit().putInt("memcap", v).apply() }
 
+    // Reverb
+    @Volatile var reverbOn: Boolean = p.getBoolean("revon", false)
+        set(v) { field = v; p.edit().putBoolean("revon", v).apply() }
+    @Volatile var reverbLevel: Int = p.getInt("revlevel", 25)          // % wet
+        set(v) { field = v; p.edit().putInt("revlevel", v).apply() }
+    @Volatile var reverbRoom: Int = p.getInt("revroom", 60)            // % room size / decay
+        set(v) { field = v; p.edit().putInt("revroom", v).apply() }
+    @Volatile var reverbDamp: Int = p.getInt("revdamp", 50)            // % damping (higher = darker tail)
+        set(v) { field = v; p.edit().putInt("revdamp", v).apply() }
+    @Volatile var reverbPre: Int = p.getInt("revpre", 20)              // ms pre-delay
+        set(v) { field = v; p.edit().putInt("revpre", v).apply() }
+
+    // App behaviour
+    @Volatile var keepScreenOn: Boolean = p.getBoolean("keepon", true)
+        set(v) { field = v; p.edit().putBoolean("keepon", v).apply() }
+    @Volatile var backgroundAudio: Boolean = p.getBoolean("bgaudio", true)
+        set(v) { field = v; p.edit().putBoolean("bgaudio", v).apply() }
+    @Volatile var language: String = p.getString("lang", "en") ?: "en"  // "en" | "fil"
+        set(v) { field = v; p.edit().putString("lang", v).apply() }
+
     fun reset() {
         masterVolume = 50; bufferBursts = 2; attackMs = 4; releaseMs = 120; transpose = 0
         tuningA4 = 440; velocitySens = 0; maxVoices = 256; memCapMb = 700
         tremSpeed = 100; tremDepth = 100
+        reverbOn = false; reverbLevel = 25; reverbRoom = 60; reverbDamp = 50; reverbPre = 20
     }
 
     fun applyToEngine() {
@@ -42,6 +63,7 @@ class Settings(context: Context) {
             masterVolume / 100f * 0.6f, attackMs.toFloat(), releaseMs.toFloat(),
             velocitySens / 100f, cents, maxVoices, memCapMb
         )
+        AudioEngine.setReverb(reverbOn, reverbLevel / 100f, reverbRoom / 100f, reverbDamp / 100f, reverbPre.toFloat())
         AudioEngine.setBufferBursts(bufferBursts)
         AudioEngine.setTranspose(transpose)       // para sa wavetable test voice
     }

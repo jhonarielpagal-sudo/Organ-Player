@@ -5,6 +5,12 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+
+/** Swell / expression shoe: controls the volume of the chosen manuals. Created by the user, saved per organ. */
+class Swell(val id: Int, var name: String, var manuals: Set<Int>, var minPct: Int) {
+    @Volatile var pos = 100        // 0..100 (current shoe position)
+}
 
 /** Hawak ang estado ng organ: stops (load/mute), couplers, tremulants, presets, MIDI actions, save/restore. */
 class OrganController(
@@ -21,13 +27,22 @@ class OrganController(
     @Volatile private var samples: SampleManager? = null
     @Volatile private var restoring = false
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
+    val swells = CopyOnWriteArrayList<Swell>()
+    private val swellListeners = CopyOnWriteArrayList<() -> Unit>()
+    private val swellPosted = AtomicBoolean(false)
+    @Volatile var activePreset: String? = null
+    private var lastStepped: String? = null
 
     fun addListener(l: () -> Unit) { listeners.add(l) }
     fun removeListener(l: () -> Unit) { listeners.remove(l) }
     fun log(s: String) = logFn(s)
     fun notifyChanged() = runUi(Runnable { listeners.forEach { it() } })
     private fun changed() {
-        if (!restoring) { performer.refreshAll(); saveState() }     // held keys follow the new registration
+        if (!restoring) {
+            performer.refreshAll()                                   // held keys follow the new registration
+            if (activePreset != null && !presetStillActive()) activePreset = null   // piston goes dark when you change anything
+            saveState()
+        }
         notifyChanged()
     }
 
@@ -46,6 +61,10 @@ class OrganController(
         performer.activeManual = o.manuals.firstOrNull { it.index == savedIdx }
             ?: o.manuals.firstOrNull { !it.isPedal } ?: o.manuals.firstOrNull()
         midiMap.load(id)
+        activePreset = null
+        loadStopConfigs()
+        loadSwells()
+        applySwells()
         AudioEngine.clearTremulants()
         o.tremulants.forEach { pushTrem(it) }
         for (m in o.manuals) for (c in m.couplers) {
@@ -71,13 +90,13 @@ class OrganController(
     private fun doLoad(s: Stop, sound: Boolean) {
         val sm = samples ?: return
         if (s.loaded) { s.enabled = sound; return }
-        s.loaded = true; s.ready = false; s.enabled = sound; s.status = "loading..."
+        s.loaded = true; s.ready = false; s.enabled = sound; s.status = tr("loading...", "naglo-load...")
         val t0 = System.currentTimeMillis()
         val mName = organ?.manuals?.firstOrNull { it.index == s.manualIndex }?.name ?: "?"
         sm.acquire(s) { r ->
             s.status = when {
-                r.failed > 0 -> "${r.failed} failed to load"
-                r.unresolved > 0 -> "${r.unresolved} missing samples"
+                r.failed > 0 -> tr("${r.failed} failed to load", "${r.failed} hindi na-load")
+                r.unresolved > 0 -> tr("${r.unresolved} missing samples", "${r.unresolved} walang sample")
                 else -> ""
             }
             if (s.loaded) s.ready = true
@@ -209,6 +228,7 @@ class OrganController(
         val p = presets()
         p.put(id, capture(false))
         prefs.edit().putString("presets_$organId", p.toString()).apply()
+        activePreset = id
         log("PRESET $id saved")
         notifyChanged()
     }
@@ -221,8 +241,127 @@ class OrganController(
             else if (s.loaded) s.enabled = false
         }
         applyCouplersAndTrem(j)
+        activePreset = id
+        lastStepped = id
         log("PRESET $id")
         changed()
+    }
+
+    private fun presetStillActive(): Boolean {
+        val id = activePreset ?: return true
+        val j = presets().optJSONObject(id) ?: return false
+        val cur = capture(false)
+        return strSet(cur.optJSONArray("on")) == strSet(j.optJSONArray("on")) &&
+            strSet(cur.optJSONArray("cp")) == strSet(j.optJSONArray("cp")) &&
+            strSet(cur.optJSONArray("tr")) == strSet(j.optJSONArray("tr"))
+    }
+
+    /** Next / previous numbered preset (only the ones that have been saved). */
+    fun stepPreset(dir: Int) {
+        val list = NUMBERED.filter { hasPreset(it) }
+        if (list.isEmpty()) { log("No numbered presets saved yet"); return }
+        val cur = activePreset?.takeIf { it in NUMBERED } ?: lastStepped?.takeIf { it in NUMBERED }
+        val idx = list.indexOf(cur)
+        val next = when {
+            idx < 0 -> if (dir > 0) list.first() else list.last()
+            else -> list[(idx + dir + list.size) % list.size]
+        }
+        recallPreset(next)
+    }
+
+    // ---------------- per-stop adjustments (volume / release / tuning) ----------------
+
+    fun saveStopConfigs() {
+        if (organ == null) return
+        val j = JSONObject()
+        for (s in allStops()) {
+            if (s.gainPct == 100 && s.releaseMs == 0 && s.tuneCents == 0 && s.pipeCents.isEmpty()) continue
+            val o = JSONObject().put("g", s.gainPct).put("r", s.releaseMs).put("c", s.tuneCents)
+            val p = JSONObject()
+            for ((n, cents) in s.pipeCents) p.put(n.toString(), cents)
+            o.put("p", p)
+            j.put(s.key, o)
+        }
+        prefs.edit().putString("stopcfg_$organId", j.toString()).apply()
+    }
+
+    private fun loadStopConfigs() {
+        val txt = prefs.getString("stopcfg_$organId", null) ?: return
+        try {
+            val j = JSONObject(txt)
+            for (k in j.keys()) {
+                val s = stopByKey(k) ?: continue
+                val o = j.getJSONObject(k)
+                s.gainPct = o.optInt("g", 100); s.releaseMs = o.optInt("r", 0); s.tuneCents = o.optInt("c", 0)
+                s.pipeCents.clear()
+                o.optJSONObject("p")?.let { p -> for (n in p.keys()) s.pipeCents[n.toInt()] = p.getInt(n) }
+            }
+        } catch (_: Exception) { }
+    }
+
+    // ---------------- swell / expression ----------------
+
+    fun addSwellListener(l: () -> Unit) { swellListeners.add(l) }
+    fun removeSwellListener(l: () -> Unit) { swellListeners.remove(l) }
+
+    fun swellById(id: Int?) = swells.firstOrNull { it.id == id }
+
+    private fun loadSwells() {
+        swells.clear()
+        val txt = prefs.getString("swells_$organId", null) ?: return
+        try {
+            val a = JSONArray(txt)
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                val ms = HashSet<Int>()
+                o.optJSONArray("m")?.let { for (k in 0 until it.length()) ms += it.getInt(k) }
+                swells.add(Swell(o.getInt("id"), o.optString("name", "Swell"), ms, o.optInt("min", 25)))
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun saveSwells() {
+        val a = JSONArray()
+        for (s in swells) {
+            a.put(JSONObject().put("id", s.id).put("name", s.name).put("min", s.minPct).put("m", JSONArray(s.manuals.toList())))
+        }
+        prefs.edit().putString("swells_$organId", a.toString()).apply()
+    }
+
+    /** Volume of every manual = product of the swell shoes that control it. */
+    fun applySwells() {
+        val g = FloatArray(16) { 1f }
+        for (s in swells) {
+            val level = (s.minPct + (100 - s.minPct) * s.pos / 100f) / 100f
+            for (m in s.manuals) if (m in 0..15) g[m] *= level
+        }
+        for (i in 0..15) AudioEngine.setGroupGain(i, g[i])
+    }
+
+    fun addSwell(): Swell {
+        val id = (swells.maxOfOrNull { it.id } ?: 0) + 1
+        val ms = organ?.manuals?.filter { !it.isPedal }?.map { it.index }?.toSet() ?: emptySet()
+        val s = Swell(id, "Swell $id", ms, 25)
+        swells.add(s)
+        saveSwells(); applySwells(); notifyChanged()
+        return s
+    }
+
+    fun removeSwell(s: Swell) {
+        swells.remove(s)
+        midiMap.clear("swell:${s.id}")
+        saveSwells(); applySwells(); notifyChanged()
+    }
+
+    /** After editing name / manuals / minimum level. */
+    fun swellEdited() { saveSwells(); applySwells() }
+
+    fun setSwellPos(s: Swell, pos: Int) {
+        s.pos = pos.coerceIn(0, 100)
+        applySwells()
+        if (swellPosted.compareAndSet(false, true)) {
+            runUi(Runnable { swellPosted.set(false); swellListeners.forEach { it() } })
+        }
     }
 
     // ---------------- MIDI channel -> manual ----------------
@@ -260,7 +399,7 @@ class OrganController(
         for (a in actions) {
             when (type) {
                 MidiMap.NOTE -> if (value > 0) run(a, value)
-                MidiMap.CC -> if (a == "vol" || midiMap.rising(a, value)) run(a, value)
+                MidiMap.CC -> if (a == "vol" || a.startsWith("swell:") || midiMap.rising(a, value)) run(a, value)
                 else -> run(a, value)
             }
         }
@@ -274,6 +413,9 @@ class OrganController(
             a == "tp+" -> setTranspose(settings.transpose + 1)
             a == "tp-" -> setTranspose(settings.transpose - 1)
             a == "tp0" -> setTranspose(0)
+            a == "preset+" -> stepPreset(1)
+            a == "preset-" -> stepPreset(-1)
+            a.startsWith("swell:") -> swellById(a.substring(6).toIntOrNull())?.let { setSwellPos(it, v * 100 / 127) }
             a == "vol" -> setVolume(v * 100 / 127)
             a.startsWith("preset:") -> recallPreset(a.substring(7))
             a.startsWith("stop:") -> stopByKey(a.substring(5))?.let { toggleStop(it) }
@@ -284,7 +426,7 @@ class OrganController(
 
     companion object {
         val DYNAMICS = listOf("P", "MP", "MF", "F", "T")
-        val NUMBERED = (1..8).map { it.toString() }
+        val NUMBERED = (1..16).map { it.toString() }
         fun presetName(id: String) = when (id) {
             "P" -> "Piano (P)"; "MP" -> "Mezzo piano (MP)"; "MF" -> "Mezzo forte (MF)"
             "F" -> "Forte (F)"; "T" -> "Tutti (T)"; else -> "Preset $id"

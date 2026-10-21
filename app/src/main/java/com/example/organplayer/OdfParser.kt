@@ -22,6 +22,12 @@ class Stop(val id: Int, val name: String, val ranks: List<StopRank>) {
     @Volatile var enabled = false        // tumutunog (hindi naka-mute)
     @Volatile var loaded = false         // samples are in memory (or loading)
     @Volatile var ready = false          // samples finished loading
+    @Volatile var tag = 0                // unique id used by the audio engine
+    // Per-stop adjustments (saved per organ)
+    @Volatile var gainPct = 100          // stop volume, %
+    @Volatile var releaseMs = 0          // 0 = use the global release
+    @Volatile var tuneCents = 0          // whole-stop tuning
+    val pipeCents = java.util.concurrent.ConcurrentHashMap<Int, Int>()   // sounding note -> cents (single pipe)
     @Volatile var manualIndex = -1
     @Volatile var status = ""
     val key: String get() = "$manualIndex.$id"
@@ -125,6 +131,7 @@ object OdfParser {
         val organLevel = level(org, "")
 
         // 0) Mga Tremulant at kung aling windchest ang apektado
+        var nextTag = 1
         val tremulants = ArrayList<Tremulant>()
         val nTrem = minOf(32, org.int("NumberOfTremulants", 0))
         for (i in 1..nTrem) {
@@ -173,7 +180,7 @@ object OdfParser {
             for (si in 1..s.int("NumberOfStops", 0)) {
                 val stopId = s.int("Stop${n3(si)}", 0)
                 val ss = ini["Stop${n3(stopId)}"] ?: continue
-                stops += parseStop(stopId, ss, ranks, organLevel, maskOf).also { it.manualIndex = mi }
+                stops += parseStop(stopId, ss, ranks, organLevel, maskOf).also { it.manualIndex = mi; it.tag = nextTag++ }
             }
             val couplers = ArrayList<Coupler>()
             for (ci in 1..s.int("NumberOfCouplers", 0)) {

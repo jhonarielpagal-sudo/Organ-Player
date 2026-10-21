@@ -148,10 +148,39 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
+// Light mono reverb (Freeverb-style: 8 comb + 4 allpass) with optional pre-delay
+struct Comb {
+    std::vector<float> buf; size_t idx = 0; float store = 0.0f;
+    void init(size_t n) { buf.assign(std::max<size_t>(1, n), 0.0f); idx = 0; store = 0.0f; }
+    inline float process(float in, float damp1, float fb) {
+        const float out = buf[idx];
+        store = out * (1.0f - damp1) + store * damp1;
+        buf[idx] = in + store * fb;
+        if (++idx >= buf.size()) idx = 0;
+        return out;
+    }
+};
+struct Allpass {
+    std::vector<float> buf; size_t idx = 0;
+    void init(size_t n) { buf.assign(std::max<size_t>(1, n), 0.0f); idx = 0; }
+    inline float process(float in) {
+        const float b = buf[idx];
+        const float out = -in + b;
+        buf[idx] = in + b * 0.5f;
+        if (++idx >= buf.size()) idx = 0;
+        return out;
+    }
+};
+
 class OrganEngine : public oboe::AudioStreamDataCallback,
                     public oboe::AudioStreamErrorCallback,
                     public std::enable_shared_from_this<OrganEngine> {
 public:
+    OrganEngine() {
+        for (auto& g : mGroupGain) g.store(1.0f);
+        mGroupCur.fill(1.0f);
+    }
+
     bool start() {
         std::lock_guard<std::mutex> lock(mLock);
         if (mTable.empty()) buildTable();
@@ -175,6 +204,7 @@ public:
         mRelease = 1.0f - std::exp(-1.0f / (mSampleRate * 0.080f));
         mVoices.reserve(kMaxVoices);
         if (mTremBuf.empty()) mTremBuf.assign((size_t) kMaxTrem * 2 * kMaxFrames, 1.0f);
+        initReverb();
 
         mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * mBursts.load());
 
@@ -282,7 +312,9 @@ public:
     std::string lastError() { std::lock_guard<std::mutex> l(mErrLock); return mLastError; }
 
     // ---- pipe trigger (MIDI thread) ----
-    void pipeOn(int key, int velocity, uint32_t tremMask) {
+    // tag = unique id ng stop (para magkahiwalay ang boses ng dalawang stop na may parehong pipe)
+    void pipeOn(int key, int velocity, uint32_t tremMask, int tag, int group,
+                float gainMul, float cents, float relMs) {
         std::shared_ptr<const Sample> s;
         {
             std::lock_guard<std::mutex> l(mSampleLock);
@@ -290,12 +322,27 @@ public:
             if (it == mSamples.end()) return;
             s = it->second;
         }
-        pushCmd({0, key, std::max(1, velocity) / 127.0f, tremMask, std::move(s)});
+        pushCmd({0, key, std::max(1, velocity) / 127.0f, tremMask, std::move(s), tag, group, gainMul, cents, relMs});
     }
-    void pipeOff(int key) { pushCmd({1, key, 0.0f, 0u, nullptr}); }
+    void pipeOff(int key, int tag) { pushCmd({1, key, 0.0f, 0u, nullptr, tag, 0, 1.0f, 0.0f, 0.0f}); }
     void panic() {
-        pushCmd({2, 0, 0.0f, 0u, nullptr});
+        pushCmd({2, 0, 0.0f, 0u, nullptr, 0, 0, 1.0f, 0.0f, 0.0f});
         for (int n = 0; n < 128; ++n) mGate[n].store(false, std::memory_order_release);
+    }
+
+    // ---- expression / swell: gain bawat group (manual) ----
+    void setGroupGain(int group, float gain) {
+        if (group < 0 || group >= kMaxGroups) return;
+        mGroupGain[group].store(std::min(2.0f, std::max(0.0f, gain)));
+    }
+
+    // ---- reverb ----
+    void setReverb(bool on, float level, float room, float damp, float preMs) {
+        mRevLevel.store(std::min(1.0f, std::max(0.0f, level)));
+        mRevRoom.store(std::min(1.0f, std::max(0.0f, room)));
+        mRevDamp.store(std::min(1.0f, std::max(0.0f, damp)));
+        mRevPre.store(std::min(250.0f, std::max(0.0f, preMs)));
+        mRevOn.store(on);
     }
 
     // ---- tremulants (slot 0..31) ----
@@ -320,7 +367,9 @@ public:
         processCommands();
         renderWavetable(out, numFrames);
         prepareTremulants(numFrames);
+        prepareGroups(numFrames);
         renderSamples(out, numFrames);
+        processReverb(out, numFrames);
 
         for (int i = 0; i < numFrames; ++i) out[i] = std::tanh(out[i]);   // soft limiter
         return oboe::DataCallbackResult::Continue;
@@ -338,8 +387,10 @@ private:
     static constexpr size_t kMaxPending = 4096;
     static constexpr int kMaxTrem = 32;
     static constexpr int kMaxFrames = 4096;
+    static constexpr int kMaxGroups = 16;
 
-    struct Cmd { int type; int key; float vel; uint32_t mask; std::shared_ptr<const Sample> s; };
+    struct Cmd { int type; int key; float vel; uint32_t mask; std::shared_ptr<const Sample> s;
+                 int tag; int group; float gain; float cents; float relMs; };
     struct Voice {
         std::shared_ptr<const Sample> s;
         double pos = 0.0;
@@ -349,6 +400,9 @@ private:
         bool releasing = false;
         int key = 0;
         uint32_t tremMask = 0;
+        int tag = 0;
+        int group = 0;
+        float relStep = 0.0f;       // 0 = gamitin ang global release
     };
 
     std::string infoLocked() {
@@ -381,14 +435,17 @@ private:
                     Voice v;
                     v.s = std::move(c.s);
                     v.ratio = (static_cast<double>(v.s->sampleRate) / static_cast<double>(mSampleRate))
-                              * std::exp2((static_cast<double>(v.s->pitchCents) + gc) / 1200.0);
-                    v.gain = (1.0f - sens * (1.0f - c.vel)) * v.s->gain;
+                              * std::exp2((static_cast<double>(v.s->pitchCents) + gc + c.cents) / 1200.0);
+                    v.gain = (1.0f - sens * (1.0f - c.vel)) * v.s->gain * c.gain;
                     v.key = c.key;
                     v.tremMask = c.mask;
+                    v.tag = c.tag;
+                    v.group = std::min(kMaxGroups - 1, std::max(0, c.group));
+                    v.relStep = c.relMs > 0.0f ? 1.0f / (c.relMs * 0.001f * mSampleRate) : 0.0f;
                     mVoices.push_back(std::move(v));
                 }
             } else if (c.type == 1) {
-                for (auto& v : mVoices) if (v.key == c.key) v.releasing = true;
+                for (auto& v : mVoices) if (v.key == c.key && v.tag == c.tag) v.releasing = true;
             } else {                                            // panic
                 for (auto& v : mVoices) v.releasing = true;
             }
@@ -450,6 +507,66 @@ private:
         }
     }
 
+    // Smooth na pagbabago ng swell/expression gain sa loob ng buffer (iwas "zipper noise")
+    void prepareGroups(int numFrames) {
+        const float k = std::min(1.0f, static_cast<float>(numFrames) / (mSampleRate * 0.02f));
+        for (int g = 0; g < kMaxGroups; ++g) {
+            const float tgt = mGroupGain[g].load(std::memory_order_relaxed);
+            const float cur = mGroupCur[g];
+            const float end = cur + (tgt - cur) * k;
+            mGroupStart[g] = cur;
+            mGroupStep[g] = (end - cur) / static_cast<float>(numFrames);
+            mGroupCur[g] = end;
+        }
+    }
+
+    void initReverb() {
+        static const int combTune[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int apTune[4] = {556, 441, 341, 225};
+        const float sc = mSampleRate / 44100.0f;
+        for (int i = 0; i < 8; ++i) mComb[i].init((size_t) (combTune[i] * sc));
+        for (int i = 0; i < 4; ++i) mAp[i].init((size_t) (apTune[i] * sc));
+        mPre.assign((size_t) (mSampleRate * 0.26f) + 2, 0.0f);
+        mPreIdx = 0;
+        mRevMixCur = 0.0f;
+        mRevIdle = true;
+    }
+
+    void clearReverb() {
+        for (auto& c : mComb) { std::fill(c.buf.begin(), c.buf.end(), 0.0f); c.store = 0.0f; }
+        for (auto& a : mAp) std::fill(a.buf.begin(), a.buf.end(), 0.0f);
+        std::fill(mPre.begin(), mPre.end(), 0.0f);
+    }
+
+    void processReverb(float* out, int numFrames) {
+        const float target = mRevOn.load(std::memory_order_relaxed) ? mRevLevel.load(std::memory_order_relaxed) : 0.0f;
+        if (target <= 0.0f && mRevMixCur <= 0.0001f) {
+            mRevMixCur = 0.0f;
+            if (!mRevIdle) { clearReverb(); mRevIdle = true; }
+            return;
+        }
+        mRevIdle = false;
+        const float fb = mRevRoom.load(std::memory_order_relaxed) * 0.28f + 0.7f;
+        const float damp1 = mRevDamp.load(std::memory_order_relaxed) * 0.4f;
+        const size_t psz = mPre.size();
+        size_t pre = static_cast<size_t>(mRevPre.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
+        if (pre >= psz) pre = psz - 1;
+        const float step = (target - mRevMixCur) / static_cast<float>(numFrames);
+        for (int i = 0; i < numFrames; ++i) {
+            const float dry = out[i];
+            mPre[mPreIdx] = dry;
+            const size_t rd = (mPreIdx >= pre) ? (mPreIdx - pre) : (mPreIdx + psz - pre);
+            const float in = mPre[rd] * 0.015f;
+            if (++mPreIdx >= psz) mPreIdx = 0;
+            float sum = 0.0f;
+            for (int c = 0; c < 8; ++c) sum += mComb[c].process(in, damp1, fb);
+            for (int a = 0; a < 4; ++a) sum = mAp[a].process(sum);
+            mRevMixCur += step;
+            out[i] = dry + sum * 3.0f * mRevMixCur;
+        }
+        mRevMixCur = target;
+    }
+
     void renderSamples(float* out, int numFrames) {
         const float attackStep = 1.0f / (mAttackMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
         const float releaseStep = 1.0f / (mReleaseMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
@@ -470,7 +587,7 @@ private:
                 if (loop && n1 >= s.loopEnd) n1 = s.loopStart;
                 const float smp = (d[idx] * (1.0f - fr) + d[n1] * fr) * (1.0f / 32768.0f);
                 if (v.releasing) {
-                    v.env -= releaseStep;
+                    v.env -= (v.relStep > 0.0f ? v.relStep : releaseStep);
                     if (v.env <= 0.0f) { done = true; break; }
                 } else if (v.env < 1.0f) {
                     v.env = std::min(1.0f, v.env + attackStep);
@@ -485,7 +602,8 @@ private:
                         pit *= mTremBuf[(size_t) (t * 2 + 1) * kMaxFrames + i];
                     }
                 }
-                out[i] += smp * v.env * v.gain * master * amp;
+                const float gm = mGroupStart[v.group] + mGroupStep[v.group] * static_cast<float>(i);
+                out[i] += smp * v.env * v.gain * master * amp * gm;
                 v.pos += v.ratio * pit;
                 if (loop) {
                     const double len = static_cast<double>(s.loopEnd - s.loopStart);
@@ -541,6 +659,25 @@ private:
     std::array<float, kMaxTrem> mTremLevel{};     // audio thread lang
     std::vector<float> mTremBuf;                  // [slot*2] = amp, [slot*2+1] = pitch
     uint32_t mTremActive = 0;
+
+    // swell / expression groups
+    std::array<std::atomic<float>, kMaxGroups> mGroupGain{};
+    std::array<float, kMaxGroups> mGroupCur{};
+    std::array<float, kMaxGroups> mGroupStart{};
+    std::array<float, kMaxGroups> mGroupStep{};
+
+    // reverb
+    std::atomic<bool> mRevOn{false};
+    std::atomic<float> mRevLevel{0.3f};
+    std::atomic<float> mRevRoom{0.5f};
+    std::atomic<float> mRevDamp{0.5f};
+    std::atomic<float> mRevPre{20.0f};
+    Comb mComb[8];
+    Allpass mAp[4];
+    std::vector<float> mPre;
+    size_t mPreIdx = 0;
+    float mRevMixCur = 0.0f;
+    bool mRevIdle = true;
 
     // wavetable test voice
     std::array<std::atomic<bool>, 128> mGate{};
@@ -599,8 +736,20 @@ Java_com_example_organplayer_AudioEngine_nativeUnloadSample(JNIEnv*, jobject, ji
     if (gEngine) gEngine->unloadSample(key);
 }
 JNIEXPORT void JNICALL
-Java_com_example_organplayer_AudioEngine_nativePipeOn(JNIEnv*, jobject, jint key, jint velocity, jint mask) {
-    if (gEngine) gEngine->pipeOn(key, velocity, (uint32_t) mask);
+Java_com_example_organplayer_AudioEngine_nativePipeOn(JNIEnv*, jobject, jint key, jint velocity, jint mask,
+                                                      jint tag, jint group, jfloat gain, jfloat cents, jfloat relMs) {
+    if (gEngine) gEngine->pipeOn(key, velocity, (uint32_t) mask, tag, group, gain, cents, relMs);
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetGroupGain(JNIEnv*, jobject, jint group, jfloat gain) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->setGroupGain(group, gain);
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetReverb(JNIEnv*, jobject, jboolean on, jfloat level,
+                                                         jfloat room, jfloat damp, jfloat preMs) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->setReverb(on != JNI_FALSE, level, room, damp, preMs);
 }
 JNIEXPORT void JNICALL
 Java_com_example_organplayer_AudioEngine_nativePanic(JNIEnv*, jobject) {
@@ -618,8 +767,8 @@ Java_com_example_organplayer_AudioEngine_nativeClearTremulants(JNIEnv*, jobject)
     if (gEngine) gEngine->clearTremulants();
 }
 JNIEXPORT void JNICALL
-Java_com_example_organplayer_AudioEngine_nativePipeOff(JNIEnv*, jobject, jint key) {
-    if (gEngine) gEngine->pipeOff(key);
+Java_com_example_organplayer_AudioEngine_nativePipeOff(JNIEnv*, jobject, jint key, jint tag) {
+    if (gEngine) gEngine->pipeOff(key, tag);
 }
 JNIEXPORT jlong JNICALL
 Java_com_example_organplayer_AudioEngine_nativeLoadedBytes(JNIEnv*, jobject) {
