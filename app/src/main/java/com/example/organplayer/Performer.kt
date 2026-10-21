@@ -3,25 +3,27 @@ package com.example.organplayer
 import java.util.TreeSet
 
 /**
- * Lohika ng pagtugtog (MIDI thread + UI thread, kaya synchronized):
- *  - unison + NORMAL coupler
- *  - MELODY coupler: pinakamataas na nakapindot lang ang tutunog
- *  - BASS coupler: pinakamababa na nakapindot lang ang tutunog
+ * Playing logic (MIDI thread + UI thread, so synchronized):
+ *  - unison + NORMAL couplers
+ *  - MELODY coupler: only the highest held note sounds
+ *  - BASS coupler: only the lowest held note sounds
  *  - MIDI channel -> manual
+ *  - refreshAll(): when stops/couplers change while keys are held, the held notes
+ *    get the added pipes (or lose the removed ones) immediately, like a real organ.
  */
 class Performer(private val settings: Settings) {
     @Volatile var samples: SampleManager? = null
     @Volatile var organ: Organ? = null
     @Volatile var activeManual: Manual? = null
-    @Volatile var channelMap: IntArray = IntArray(16) { -1 }      // -1 = gamitin ang active manual
+    @Volatile var channelMap: IntArray = IntArray(16) { -1 }      // -1 = use the active manual
 
     private class Special(val note: Int, val hits: SampleManager.Hits)
 
-    private val held = HashMap<Int, TreeSet<Int>>()               // manual -> nakapindot na notes
+    private val held = HashMap<Int, TreeSet<Int>>()               // manual -> held notes
     private val vels = HashMap<Int, Int>()                        // manual*128+note -> velocity
     private val owner = HashMap<Int, Int>()                       // channel*128+note -> manual
-    private val unison = HashMap<Int, SampleManager.Hits>()       // manual*128+note -> pipes
-    private val special = HashMap<Int, Special>()                 // coupler id -> kasalukuyang tunog
+    private val unison = HashMap<Int, SampleManager.Hits>()       // manual*128+note -> sounding pipes
+    private val special = HashMap<Int, Special>()                 // coupler id -> sounding pipes
 
     private fun manualFor(ch: Int): Manual? {
         val o = organ ?: return null
@@ -38,7 +40,15 @@ class Performer(private val settings: Settings) {
         for (k in h.keys) AudioEngine.pipeOff(k)
     }
 
-    /** false = walang organ/manual (gagamitin ang test wavetable) */
+    /** Starts only the pipes that were added and releases only the pipes that were removed. */
+    private fun diff(old: SampleManager.Hits, new: SampleManager.Hits, vel: Int) {
+        val oldSet = old.keys.toHashSet()
+        val newSet = new.keys.toHashSet()
+        for (k in old.keys) if (k !in newSet) AudioEngine.pipeOff(k)
+        for (i in new.keys.indices) if (new.keys[i] !in oldSet) AudioEngine.pipeOn(new.keys[i], vel, new.masks[i])
+    }
+
+    /** false = no organ/manual (the test wavetable is used instead) */
     @Synchronized
     fun noteOn(channel: Int, note: Int, vel: Int): Boolean {
         val sm = samples ?: return false
@@ -51,7 +61,7 @@ class Performer(private val settings: Settings) {
         val h = sm.normalHits(m, note)
         unison[id] = h
         trigger(h, vel)
-        updateSpecial(m)
+        updateSpecial(m, false)
         return true
     }
 
@@ -62,17 +72,31 @@ class Performer(private val settings: Settings) {
         held[mi]?.remove(note)
         vels.remove(id)
         unison.remove(id)?.let { release(it) }
-        organ?.manuals?.firstOrNull { it.index == mi }?.let { updateSpecial(it) }
+        organ?.manuals?.firstOrNull { it.index == mi }?.let { updateSpecial(it, false) }
         return true
     }
 
-    /** Tawagin kapag may in-on/off na coupler habang may nakapindot na key. */
+    /** Call after any stop / coupler / transpose change: updates the notes that are being held. */
     @Synchronized
-    fun refreshCouplers() {
-        organ?.manuals?.forEach { updateSpecial(it) }
+    fun refreshAll() {
+        val sm = samples ?: return
+        val o = organ ?: return
+        for ((mi, set) in held) {
+            val m = o.manuals.firstOrNull { it.index == mi } ?: continue
+            for (note in set) {
+                val id = mi * 128 + note
+                val old = unison[id] ?: continue
+                val new = sm.normalHits(m, note)
+                diff(old, new, vels[id] ?: 100)
+                unison[id] = new
+            }
+        }
+        for (m in o.manuals) updateSpecial(m, true)
     }
 
-    private fun updateSpecial(m: Manual) {
+    fun refreshCouplers() = refreshAll()
+
+    private fun updateSpecial(m: Manual, refresh: Boolean) {
         val sm = samples ?: return
         val o = organ ?: return
         val set = held[m.index]
@@ -84,11 +108,18 @@ class Performer(private val settings: Settings) {
                 c.kind == CouplerKind.MELODY -> set.last()
                 else -> set.first()
             }
-            if (cur != null && cur.note == target) continue
             if (cur == null && target == null) continue
+            val dest = o.manuals.firstOrNull { it.index == c.destManual }
+            if (cur != null && target != null && cur.note == target) {
+                if (refresh && dest != null) {
+                    val h = sm.hitsForNote(dest, target + c.keyShift + settings.transpose)
+                    diff(cur.hits, h, vels[m.index * 128 + target] ?: 100)
+                    special[c.id] = Special(target, h)
+                }
+                continue
+            }
             if (cur != null) { release(cur.hits); special.remove(c.id) }
-            if (target != null) {
-                val dest = o.manuals.firstOrNull { it.index == c.destManual } ?: continue
+            if (target != null && dest != null) {
                 val h = sm.hitsForNote(dest, target + c.keyShift + settings.transpose)
                 special[c.id] = Special(target, h)
                 trigger(h, vels[m.index * 128 + target] ?: 100)

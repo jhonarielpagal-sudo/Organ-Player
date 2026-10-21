@@ -109,8 +109,8 @@ class SampleManager(
                 }
                 if (pending.decrementAndGet() == 0) {
                     val reasons = listOf(
-                        "walang file" to notFound.get(), "hindi mabuksan" to openFail.get(),
-                        "hindi suportadong WAV" to badWav.get(), "iba pa" to other.get()
+                        "file not found" to notFound.get(), "cannot open" to openFail.get(),
+                        "unsupported WAV" to badWav.get(), "other" to other.get()
                     ).filter { it.second > 0 }.joinToString(", ") { "${it.first}: ${it.second}" }
                     onDone(Report(toLoad.size - failed.get(), failed.get(), shared, unresolved, reasons, firstError.get()))
                 }
@@ -141,7 +141,7 @@ class SampleManager(
     private fun collectNote(manual: Manual, note: Int, out: LinkedHashMap<Int, Int>) {
         val k = note - manual.firstMidiNote + 1          // logical key number (1-based)
         for (s in manual.stops) {
-            if (!s.enabled) continue                      // naka-mute / naka-off
+            if (!s.enabled || !s.ready) continue            // muted / off / still loading
             for (r in s.ranks) {
                 if (k < r.firstAccessibleKey || k >= r.firstAccessibleKey + r.pipeCount) continue
                 val t = target(r.rank, r.firstPipeNumber + (k - r.firstAccessibleKey)) ?: continue
@@ -189,12 +189,12 @@ class SampleManager(
         val path = t.pipe.path ?: return -1
         val uri = findFile(path)
         if (uri == null) {
-            firstError.compareAndSet(null, "Walang file: $path")
+            firstError.compareAndSet(null, "File not found: $path")
             return -1
         }
         val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
         if (pfd == null) {
-            firstError.compareAndSet(null, "Hindi mabuksan: $path")
+            firstError.compareAndSet(null, "Cannot open: $path")
             return -2
         }
         val code = AudioEngine.loadSample(t.key, pfd.detachFd(), t.pipe.tuneCents, t.pipe.gainLinear)

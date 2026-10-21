@@ -55,7 +55,7 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
     if (b.size() < 44 || memcmp(b.data(), "RIFF", 4) != 0 || memcmp(b.data() + 8, "WAVE", 4) != 0) {
         char h[5] = {0, 0, 0, 0, 0};
         for (int i = 0; i < 4 && i < (int) b.size(); ++i) h[i] = (b[i] >= 32 && b[i] < 127) ? (char) b[i] : '?';
-        snprintf(msg, sizeof(msg), "Hindi RIFF/WAVE ang file (header '%s', %zu bytes)", h, b.size());
+        snprintf(msg, sizeof(msg), "Not a RIFF/WAVE file (header '%s', %zu bytes)", h, b.size());
         err = msg;
         return nullptr;
     }
@@ -93,13 +93,13 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
         p = body + len + (sz & 1);
     }
     if (!pcm || channels < 1 || rate == 0) {
-        err = "Sira ang WAV: walang fmt/data chunk";
+        err = "Corrupt WAV: missing fmt/data chunk";
         return nullptr;
     }
     const bool isPcm = fmtTag == 1 && (bits == 16 || bits == 24 || bits == 32);
     const bool isFloat = fmtTag == 3 && bits == 32;
     if (!isPcm && !isFloat) {
-        snprintf(msg, sizeof(msg), "Hindi suportadong WAV format: tag=%u bits=%u ch=%u", fmtTag, bits, channels);
+        snprintf(msg, sizeof(msg), "Unsupported WAV format: tag=%u bits=%u ch=%u", fmtTag, bits, channels);
         err = msg;
         return nullptr;
     }
@@ -107,7 +107,7 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
     const size_t bytesPer = bits / 8;
     const size_t frameBytes = bytesPer * channels;
     const size_t frames = pcmBytes / frameBytes;
-    if (frames < 2) { err = "Masyadong maikli ang WAV"; return nullptr; }
+    if (frames < 2) { err = "WAV is too short"; return nullptr; }
 
     auto s = std::make_shared<Sample>();
     s->data.resize(frames);
@@ -243,7 +243,7 @@ public:
         std::vector<uint8_t> buf;
         bool ok = readAll(fd, buf);
         close(fd);
-        if (!ok) { setError("Hindi mabasa ang file (read error o walang laman)"); return 1; }
+        if (!ok) { setError("Cannot read file (read error or empty)"); return 1; }
         std::string err;
         std::shared_ptr<Sample> s = parseWav(buf, err);
         buf.clear();
@@ -254,7 +254,7 @@ public:
         const size_t bytes = s->data.size() * sizeof(int16_t);
         std::lock_guard<std::mutex> l(mSampleLock);
         if (mLoadedBytes + bytes > mMaxBytes.load()) {
-            setError("Sobra sa memory cap (taasan sa Settings)");
+            setError("Over the memory cap (raise it in Settings)");
             return 3;
         }
         auto it = mSamples.find(key);
@@ -352,7 +352,7 @@ private:
     };
 
     std::string infoLocked() {
-        if (!mStream) return "Naka-stop ang audio";
+        if (!mStream) return "Audio stopped";
         char buf[200];
         snprintf(buf, sizeof(buf), "Audio: %s, %d Hz, burst %d, buffer %d frames (~%.1f ms)",
                  oboe::convertToText(mStream->getAudioApi()), mStream->getSampleRate(),
@@ -631,7 +631,7 @@ Java_com_example_organplayer_AudioEngine_nativeLoadedCount(JNIEnv*, jobject) {
 }
 JNIEXPORT jstring JNICALL
 Java_com_example_organplayer_AudioEngine_nativeLastError(JNIEnv* env, jobject) {
-    std::string e = gEngine ? gEngine->lastError() : std::string("walang engine");
+    std::string e = gEngine ? gEngine->lastError() : std::string("no engine");
     return env->NewStringUTF(e.c_str());
 }
 JNIEXPORT void JNICALL
@@ -648,7 +648,7 @@ Java_com_example_organplayer_AudioEngine_nativeSetBufferBursts(JNIEnv*, jobject,
 }
 JNIEXPORT jstring JNICALL
 Java_com_example_organplayer_AudioEngine_nativeInfo(JNIEnv* env, jobject) {
-    std::string e = gEngine ? gEngine->info() : std::string("Walang audio engine");
+    std::string e = gEngine ? gEngine->info() : std::string("No audio engine");
     return env->NewStringUTF(e.c_str());
 }
 

@@ -6,9 +6,9 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/** Settings: i-type na lang ang numero (o gamitin ang - / +). */
+/** Settings: type the number (or use - / +). */
 object SettingsDialog {
-    fun show(act: Activity, s: Settings) {
+    fun show(act: Activity, s: Settings, onTremChanged: () -> Unit = {}) {
         val pad = UiKit.dp(act, 16)
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -29,20 +29,22 @@ object SettingsDialog {
         }
 
         field("Master volume", 0, 100, "%", s.masterVolume, 5) { s.masterVolume = it }
-        field("Transpose", -12, 12, "semitone", s.transpose) { s.transpose = it }
+        field("Transpose", -12, 12, "semitones", s.transpose) { s.transpose = it }
         field("Tuning (A4)", 415, 466, "Hz", s.tuningA4) { s.tuningA4 = it }
-        field("Audio buffer", 1, 8, "burst", s.bufferBursts) { s.bufferBursts = it }
+        field("Audio buffer", 1, 8, "bursts", s.bufferBursts) { s.bufferBursts = it }
         field("Attack", 1, 100, "ms", s.attackMs) { s.attackMs = it }
         field("Release", 10, 3000, "ms", s.releaseMs, 10) { s.releaseMs = it }
         field("Velocity sensitivity", 0, 100, "%", s.velocitySens, 5) { s.velocitySens = it }
-        field("Max na sabay na tunog", 16, 512, "", s.maxVoices, 16) { s.maxVoices = it }
-        field("Memory cap (samples)", 100, 2000, "MB", s.memCapMb, 50) { s.memCapMb = it }
+        field("Tremulant speed", 25, 200, "%", s.tremSpeed, 5) { s.tremSpeed = it; onTremChanged() }
+        field("Tremulant depth", 0, 300, "%", s.tremDepth, 5) { s.tremDepth = it; onTremChanged() }
+        field("Max simultaneous voices", 16, 512, "", s.maxVoices, 16) { s.maxVoices = it }
+        field("Sample memory cap", 100, 2000, "MB", s.memCapMb, 50) { s.memCapMb = it }
 
         val dlg = AlertDialog.Builder(act)
             .setTitle("Settings")
             .setView(ScrollView(act).apply { addView(box) })
             .setPositiveButton("OK") { _, _ -> fields.forEach { it.commit() } }
-            .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine(); show(act, s) }
+            .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine(); onTremChanged(); show(act, s, onTremChanged) }
             .create()
         dlg.setOnDismissListener { fields.forEach { it.commit() } }
         dlg.show()

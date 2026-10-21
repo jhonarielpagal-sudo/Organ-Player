@@ -11,7 +11,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 
-/** Dialog na may listahan ng rows na nag-a-update kapag may nagbago (hal. natapos ang MIDI learn). */
+/** Dialog whose rows refresh when something changes (e.g. a MIDI learn finished). */
 private fun liveDialog(act: Activity, c: OrganController, title: String, closeText: String,
                        neutral: Pair<String, () -> Unit>?, fill: (LinearLayout) -> Unit): AlertDialog {
     val pad = UiKit.dp(act, 12)
@@ -37,14 +37,14 @@ private fun labelRow(act: Activity, text: String, vararg views: View): LinearLay
         views.forEach { addView(it) }
     }
 
-/** Mga global na MIDI mapping (stops/couplers/tremulants ay sa Stops panel). */
+/** Global MIDI mappings (stops/couplers/tremulants are mapped in the Stops panel). */
 object MidiMapDialog {
     fun show(act: Activity, c: OrganController) {
-        liveDialog(act, c, "MIDI mapping", "Isara", "Burahin lahat" to { c.midiMap.clearAll(); c.notifyChanged() }) { box ->
+        liveDialog(act, c, "MIDI mapping", "Close", "Clear all" to { c.midiMap.clearAll(); c.notifyChanged() }) { box ->
             box.addView(TextView(act).apply {
                 textSize = 12f
-                text = "Pindutin ang button, saka pindutin ang key/piston/knob sa MIDI device. " +
-                    "Ang stops, couplers at tremulants ay minamapa sa Stops panel (may MIDI button bawat isa)."
+                text = "Tap a button, then press a key / piston / knob on your MIDI device. " +
+                    "Stops, couplers and tremulants are mapped in the Stops panel (each has its own MIDI button)."
             })
             fun add(action: String, label: String) =
                 box.addView(labelRow(act, label, UiKit.mapButton(act, c, action, label)))
@@ -54,26 +54,34 @@ object MidiMapDialog {
             add("tp-", "Transpose -1")
             add("tp0", "Transpose 0")
             add("vol", "Master volume (CC knob/fader)")
-            for (n in 1..8) add("preset:$n", "I-recall ang Preset $n")
+            box.addView(UiKit.header(act, "Dynamics"))
+            for (id in OrganController.DYNAMICS) add("preset:$id", "Recall " + OrganController.presetName(id))
+            box.addView(UiKit.header(act, "Numbered presets"))
+            for (id in OrganController.NUMBERED) add("preset:$id", "Recall preset $id")
         }
     }
 }
 
 object PresetsDialog {
     fun show(act: Activity, c: OrganController) {
-        if (c.organ == null) { c.log("Pumili muna ng organ."); return }
-        liveDialog(act, c, "Presets (combinations)", "Isara", null) { box ->
+        if (c.organ == null) { c.log("Load an organ first."); return }
+        liveDialog(act, c, "Presets (combinations)", "Close", null) { box ->
             box.addView(TextView(act).apply {
                 textSize = 12f
-                text = "Sine-save ang kasalukuyang tumutunog na stops, couplers at tremulants."
+                text = "Set up your stops, couplers and tremulants, then tap Save. Recall brings that registration back."
             })
-            for (n in 1..8) {
-                val has = c.hasPreset(n)
-                box.addView(labelRow(act, "Preset $n" + if (has) "" else "  (walang laman)",
-                    UiKit.button(act, "Save") { c.savePreset(n) },
-                    UiKit.button(act, "Recall") { c.recallPreset(n) }.apply { isEnabled = has },
-                    UiKit.mapButton(act, c, "preset:$n", "I-recall ang Preset $n")))
+            fun addRow(id: String) {
+                val has = c.hasPreset(id)
+                val name = OrganController.presetName(id)
+                box.addView(labelRow(act, name + if (has) "" else "  (empty)",
+                    UiKit.button(act, "Save") { c.savePreset(id) },
+                    UiKit.button(act, "Recall") { c.recallPreset(id) }.apply { isEnabled = has },
+                    UiKit.mapButton(act, c, "preset:$id", "Recall $name")))
             }
+            box.addView(UiKit.header(act, "Dynamics"))
+            OrganController.DYNAMICS.forEach { addRow(it) }
+            box.addView(UiKit.header(act, "Numbered presets"))
+            OrganController.NUMBERED.forEach { addRow(it) }
         }
     }
 }
@@ -81,12 +89,12 @@ object PresetsDialog {
 object ChannelMapDialog {
     fun show(act: Activity, c: OrganController) {
         val o = c.organ
-        if (o == null) { c.log("Pumili muna ng organ."); return }
+        if (o == null) { c.log("Load an organ first."); return }
         val pad = UiKit.dp(act, 12)
         val box = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad, pad, pad) }
         box.addView(TextView(act).apply {
             textSize = 12f
-            text = "Aling manual ang tutugtugin ng bawat MIDI channel. \"Active manual\" = ang pinili sa main screen."
+            text = "Choose which manual each MIDI channel plays. \"Active manual\" = the one selected on the main screen."
         })
         val map = c.performer.channelMap.copyOf()
         val names = listOf("Active manual") + o.manuals.map { (if (it.isPedal) "Pedal: " else "") + it.name }
@@ -111,7 +119,7 @@ object ChannelMapDialog {
         AlertDialog.Builder(act).setTitle("MIDI channel -> manual")
             .setView(ScrollView(act).apply { addView(box) })
             .setPositiveButton("OK") { _, _ -> c.setChannelMap(map) }
-            .setNegativeButton("Kanselahin", null)
+            .setNegativeButton("Cancel", null)
             .show()
     }
 }

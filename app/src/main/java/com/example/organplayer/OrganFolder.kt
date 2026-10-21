@@ -59,7 +59,7 @@ class OrganFolder(context: Context, private val treeUri: Uri) {
     fun readBytes(docId: String): ByteArray {
         val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
         return resolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw IOException("Hindi mabuksan ang file")
+            ?: throw IOException("Cannot open file")
     }
 
     /** Hinahanap ang file (case-insensitive, "\" o "/"). Null kung wala. */

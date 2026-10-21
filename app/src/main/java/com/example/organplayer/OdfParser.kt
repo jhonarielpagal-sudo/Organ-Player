@@ -20,7 +20,8 @@ class StopRank(val rank: Rank, val firstPipeNumber: Int, val pipeCount: Int, val
 
 class Stop(val id: Int, val name: String, val ranks: List<StopRank>) {
     @Volatile var enabled = false        // tumutunog (hindi naka-mute)
-    @Volatile var loaded = false         // naka-load sa memory ang samples
+    @Volatile var loaded = false         // samples are in memory (or loading)
+    @Volatile var ready = false          // samples finished loading
     @Volatile var manualIndex = -1
     @Volatile var status = ""
     val key: String get() = "$manualIndex.$id"
@@ -120,7 +121,7 @@ object OdfParser {
     fun parse(text: String, fallbackName: String): Organ {
         val ini = IniParser.parse(text)
         val org = ini["Organ"]
-            ?: throw IllegalArgumentException("Walang [Organ] section - hindi ito GrandOrgue .organ file")
+            ?: throw IllegalArgumentException("No [Organ] section - this is not a GrandOrgue .organ file")
         val organLevel = level(org, "")
 
         // 0) Mga Tremulant at kung aling windchest ang apektado

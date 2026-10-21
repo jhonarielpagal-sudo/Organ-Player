@@ -14,8 +14,8 @@ import android.widget.Button
 
 /**
  * Panel ng stops/ranks, tremulants at couplers.
- *  - "Naka-load": mga stop na nasa memory; Switch = unmute/mute (nananatiling naka-load), X = i-unload
- *  - "Lahat": lahat ng stops; check = i-load (at patunugin), uncheck = i-unload
+ *  - "Loaded": stops in memory; Switch = unmute/mute (stays loaded), X = unload
+ *  - "All stops": every stop; tick = load (and sound), untick = unload
  * Bawat item ay may MIDI button para sa mapping.
  */
 class StopsPanel(private val act: Activity, private val c: OrganController) {
@@ -36,20 +36,20 @@ class StopsPanel(private val act: Activity, private val c: OrganController) {
         val top = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
         top.addView(TextView(act).apply { text = "Stops / Couplers / Tremulants"; textSize = 16f },
             LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        top.addView(UiKit.button(act, "Isara") { dialog.dismiss() })
+        top.addView(UiKit.button(act, "Close") { dialog.dismiss() })
         root.addView(top)
 
         val tabs = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
-        tabLoaded = UiKit.button(act, "Naka-load") { tab = 0; rebuild() }
-        tabAll = UiKit.button(act, "Lahat ng stops") { tab = 1; rebuild() }
+        tabLoaded = UiKit.button(act, "Loaded") { tab = 0; rebuild() }
+        tabAll = UiKit.button(act, "All stops") { tab = 1; rebuild() }
         tabs.addView(tabLoaded, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         tabs.addView(tabAll, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(tabs)
 
         val tools = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
         tools.addView(UiKit.button(act, "General Cancel") { c.generalCancel() })
-        tools.addView(UiKit.mapButton(act, c, "gc", "General Cancel (i-mute lahat ng stops)"))
-        tools.addView(UiKit.button(act, "I-unload lahat") { c.unloadAllStops() })
+        tools.addView(UiKit.mapButton(act, c, "gc", "General Cancel (stops, couplers, tremulants off)"))
+        tools.addView(UiKit.button(act, "Unload all") { c.unloadAllStops() })
         root.addView(tools)
 
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -86,7 +86,7 @@ class StopsPanel(private val act: Activity, private val c: OrganController) {
         tabAll.alpha = if (tab == 1) 1f else 0.5f
         val o = c.organ
         if (o == null) {
-            content.addView(TextView(act).apply { text = "Wala pang organ na naka-load." })
+            content.addView(TextView(act).apply { text = "No organ loaded yet." })
             return
         }
 
@@ -141,7 +141,7 @@ class StopsPanel(private val act: Activity, private val c: OrganController) {
         }
         if (shown == 0 && tab == 0) {
             content.addView(TextView(act).apply {
-                text = "\nWala pang naka-load na stop. Pumunta sa \"Lahat ng stops\" at i-check ang gusto mong i-load."
+                text = "\nNo stops loaded yet. Go to \"All stops\" and tick the ones you want to load."
             })
         }
         scroll.post { scroll.scrollTo(0, y) }

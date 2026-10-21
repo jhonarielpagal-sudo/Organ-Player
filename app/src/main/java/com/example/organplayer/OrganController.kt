@@ -26,7 +26,10 @@ class OrganController(
     fun removeListener(l: () -> Unit) { listeners.remove(l) }
     fun log(s: String) = logFn(s)
     fun notifyChanged() = runUi(Runnable { listeners.forEach { it() } })
-    private fun changed() { if (!restoring) saveState(); notifyChanged() }
+    private fun changed() {
+        if (!restoring) { performer.refreshAll(); saveState() }     // held keys follow the new registration
+        notifyChanged()
+    }
 
     // ---------------- organ ----------------
 
@@ -68,17 +71,18 @@ class OrganController(
     private fun doLoad(s: Stop, sound: Boolean) {
         val sm = samples ?: return
         if (s.loaded) { s.enabled = sound; return }
-        s.loaded = true; s.enabled = sound; s.status = "naglo-load..."
+        s.loaded = true; s.ready = false; s.enabled = sound; s.status = "loading..."
         val t0 = System.currentTimeMillis()
         val mName = organ?.manuals?.firstOrNull { it.index == s.manualIndex }?.name ?: "?"
         sm.acquire(s) { r ->
             s.status = when {
-                r.failed > 0 -> "${r.failed} hindi na-load"
-                r.unresolved > 0 -> "${r.unresolved} walang sample"
+                r.failed > 0 -> "${r.failed} failed to load"
+                r.unresolved > 0 -> "${r.unresolved} missing samples"
                 else -> ""
             }
+            if (s.loaded) s.ready = true
             log("STOP LOAD $mName: ${s.name} -> ${r.loaded} loaded, ${r.shared} shared, ${r.failed} failed, " +
-                "${r.unresolved} walang path/REF, ${System.currentTimeMillis() - t0} ms")
+                "${r.unresolved} no path/REF, ${System.currentTimeMillis() - t0} ms")
             if (r.reasons.isNotEmpty()) log("  ! ${r.reasons}")
             r.firstError?.let { log("  ! $it") }
             changed()
@@ -87,7 +91,7 @@ class OrganController(
 
     private fun doUnload(s: Stop) {
         if (!s.loaded) return
-        s.enabled = false; s.loaded = false; s.status = ""
+        s.enabled = false; s.ready = false; s.loaded = false; s.status = ""
         samples?.release(s)
     }
 
@@ -99,10 +103,14 @@ class OrganController(
     }
     fun toggleStop(s: Stop) = setSound(s, !(s.loaded && s.enabled))
 
-    /** General Cancel: i-mute ang lahat ng stops (nananatiling naka-load). */
+    /** General Cancel: stops muted (still loaded), all couplers disengaged, all tremulants off. */
     fun generalCancel() {
         allStops().forEach { if (it.loaded) it.enabled = false }
-        log("GENERAL CANCEL")
+        organ?.let { o ->
+            o.manuals.forEach { m -> m.couplers.forEach { it.engaged = false } }
+            o.tremulants.forEach { if (it.on) { it.on = false; pushTrem(it) } }
+        }
+        log("GENERAL CANCEL (stops, couplers, tremulants off)")
         changed()
     }
 
@@ -119,10 +127,14 @@ class OrganController(
         changed()
     }
 
+    /** Constant speed and depth from start to release (fast fixed fade only to avoid clicks). */
     private fun pushTrem(t: Tremulant) {
-        fun ramp(rate: Int) = (10000f / rate.coerceAtLeast(1)).coerceIn(20f, 5000f)
-        AudioEngine.setTremulant(t.slot, t.on, t.periodMs, t.depthPct, ramp(t.startRate), ramp(t.stopRate))
+        val speed = settings.tremSpeed.coerceAtLeast(10) / 100f
+        val depth = settings.tremDepth / 100f
+        AudioEngine.setTremulant(t.slot, t.on, t.periodMs / speed, (t.depthPct * depth).coerceAtMost(100f), 60f, 120f)
     }
+
+    fun repushTremulants() { organ?.tremulants?.forEach { pushTrem(it) } }
 
     fun setTremulant(t: Tremulant, on: Boolean) {
         t.on = on
@@ -183,32 +195,33 @@ class OrganController(
             for (s in allStops()) if (s.key in loaded) doLoad(s, s.key in on)
             applyCouplersAndTrem(j)
         } catch (e: Exception) {
-            log("Hindi na-restore ang dating setup: ${e.message}")
+            log("Could not restore the previous setup: ${e.message}")
         } finally { restoring = false }
     }
 
     private fun presets(): JSONObject =
         try { JSONObject(prefs.getString("presets_$organId", null) ?: "{}") } catch (_: Exception) { JSONObject() }
 
-    fun hasPreset(n: Int) = presets().has(n.toString())
+    fun hasPreset(id: String) = presets().has(id)
 
-    fun savePreset(n: Int) {
+    fun savePreset(id: String) {
+        if (organ == null) return
         val p = presets()
-        p.put(n.toString(), capture(false))
+        p.put(id, capture(false))
         prefs.edit().putString("presets_$organId", p.toString()).apply()
-        log("PRESET $n na-save")
+        log("PRESET $id saved")
         notifyChanged()
     }
 
-    fun recallPreset(n: Int) {
-        val j = presets().optJSONObject(n.toString()) ?: run { log("PRESET $n: walang laman"); return }
+    fun recallPreset(id: String) {
+        val j = presets().optJSONObject(id) ?: run { log("PRESET $id: empty"); return }
         val on = strSet(j.optJSONArray("on"))
         for (s in allStops()) {
             if (s.key in on) { if (s.loaded) s.enabled = true else doLoad(s, true) }
             else if (s.loaded) s.enabled = false
         }
         applyCouplersAndTrem(j)
-        log("PRESET $n")
+        log("PRESET $id")
         changed()
     }
 
@@ -262,10 +275,19 @@ class OrganController(
             a == "tp-" -> setTranspose(settings.transpose - 1)
             a == "tp0" -> setTranspose(0)
             a == "vol" -> setVolume(v * 100 / 127)
-            a.startsWith("preset:") -> recallPreset(a.substring(7).toIntOrNull() ?: 0)
+            a.startsWith("preset:") -> recallPreset(a.substring(7))
             a.startsWith("stop:") -> stopByKey(a.substring(5))?.let { toggleStop(it) }
             a.startsWith("cp:") -> couplerById(a.substring(3).toIntOrNull())?.let { setCoupler(it, !it.engaged) }
             a.startsWith("trem:") -> tremById(a.substring(5).toIntOrNull())?.let { setTremulant(it, !it.on) }
+        }
+    }
+
+    companion object {
+        val DYNAMICS = listOf("P", "MP", "MF", "F", "T")
+        val NUMBERED = (1..8).map { it.toString() }
+        fun presetName(id: String) = when (id) {
+            "P" -> "Piano (P)"; "MP" -> "Mezzo piano (MP)"; "MF" -> "Mezzo forte (MF)"
+            "F" -> "Forte (F)"; "T" -> "Tutti (T)"; else -> "Preset $id"
         }
     }
 }

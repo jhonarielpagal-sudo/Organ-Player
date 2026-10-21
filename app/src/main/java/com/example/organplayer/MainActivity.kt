@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -19,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity(), MidiInputManager.Listener {
 
@@ -49,7 +51,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
 
         if (packageManager.hasSystemFeature(PackageManager.FEATURE_MIDI)) {
             midi = MidiInputManager(this, this)
-        } else onStatus("Walang MIDI support ang device na ito.")
+        } else onStatus("This device has no MIDI support.")
 
         prefs.getString(KEY_TREE, null)?.let {
             try { loadFolder(Uri.parse(it)) } catch (e: Exception) { Log.w(TAG, "restore failed", e) }
@@ -58,7 +60,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
 
     override fun onStart() {
         super.onStart()
-        if (!AudioEngine.start()) onStatus("Hindi nagsimula ang audio engine (Logcat: OrganEngine)")
+        if (!AudioEngine.start()) onStatus("Audio engine failed to start (Logcat: OrganEngine)")
         settings.applyToEngine()
         midi?.start()
     }
@@ -95,7 +97,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     private fun organId(r: OrganFolder.OrganRef) = "${r.dirName}/${r.name}"
 
     private fun loadFolder(uri: Uri) {
-        onStatus("Hinahanap ang .organ file...")
+        onStatus("Looking for .organ files...")
         Thread {
             try {
                 val f = OrganFolder(this, uri)
@@ -104,7 +106,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
                     folder = f
                     organFiles = files
                     when {
-                        files.isEmpty() -> onStatus("Walang .organ file sa folder na ito (na-extract na ba ang rar?)")
+                        files.isEmpty() -> onStatus("No .organ file in this folder (is the archive extracted?)")
                         files.size == 1 -> loadOrgan(f, files[0])
                         else -> {
                             val saved = prefs.getString(KEY_ORGAN, null)
@@ -115,7 +117,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "loadFolder", e)
-                onStatus("Error sa folder: ${e.message}")
+                onStatus("Folder error: ${e.message}")
             }
         }.start()
     }
@@ -123,10 +125,10 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     /** Pumili sa mga .organ file sa folder (may mga sample set na maraming .organ). */
     private fun chooseOrgan() {
         val f = folder
-        if (f == null || organFiles.isEmpty()) { onStatus("Pumili muna ng organ folder."); return }
+        if (f == null || organFiles.isEmpty()) { onStatus("Choose an organ folder first."); return }
         val labels = organFiles.map { if (it.dirName.isEmpty()) it.name else "${it.name}  (${it.dirName})" }
         AlertDialog.Builder(this)
-            .setTitle("Pumili ng .organ (${organFiles.size})")
+            .setTitle("Choose an .organ file (${organFiles.size})")
             .setItems(labels.toTypedArray()) { _, w ->
                 prefs.edit().putString(KEY_ORGAN, organId(organFiles[w])).apply()
                 loadOrgan(f, organFiles[w])
@@ -135,7 +137,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     }
 
     private fun loadOrgan(f: OrganFolder, ref: OrganFolder.OrganRef) {
-        onStatus("Binabasa ang ${ref.name}...")
+        onStatus("Reading ${ref.name}...")
         Thread {
             try {
                 val text = OrganFolder.decode(f.readBytes(ref.docId))
@@ -143,7 +145,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
                 runOnUiThread { showOrgan(o, f, ref) }
             } catch (e: Exception) {
                 Log.e(TAG, "loadOrgan", e)
-                onStatus("Error sa ODF: ${e.message}")
+                onStatus("ODF error: ${e.message}")
             }
         }.start()
     }
@@ -152,9 +154,9 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         c.attach(o, f, ref, organId(ref))
         val stopCount = o.manuals.sumOf { it.stops.size }
         val couplerCount = o.manuals.sumOf { it.couplers.size }
-        organInfo.text = "${o.name}\n${ref.name}  -  ${o.manuals.size} manual, $stopCount stops, " +
+        organInfo.text = "${o.name}\n${ref.name}  -  ${o.manuals.size} manuals, $stopCount stops, " +
             "$couplerCount couplers, ${o.tremulants.size} tremulants"
-        onStatus("Nabasa: ${o.name}")
+        onStatus("Loaded: ${o.name}")
         setupManualSpinner(o)
         onStateChanged()
     }
@@ -182,7 +184,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     private fun onStateChanged() {
         transposeField.setValue(settings.transpose)
         volumeField.setValue(settings.masterVolume)
-        memView.text = "Samples: ${AudioEngine.loadedCount()} naka-load (${AudioEngine.loadedBytes() / 1_048_576} MB)"
+        memView.text = "Samples: ${AudioEngine.loadedCount()} loaded (${AudioEngine.loadedBytes() / 1_048_576} MB)"
     }
 
     // ---------------- MIDI callbacks (MIDI thread) ----------------
@@ -235,17 +237,30 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         for ((t, a) in items) addView(UiKit.button(context, t, a), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
     }
 
+    private fun confirmSave(id: String) {
+        val name = OrganController.presetName(id)
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setMessage("Save the current stops, couplers and tremulants to this button?")
+            .setPositiveButton("Save") { _, _ ->
+                c.savePreset(id)
+                Toast.makeText(this, "Saved $name", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(28), dp(12), dp(8))
         }
-        statusView = TextView(this).apply { textSize = 13f; text = "Naghihintay ng MIDI device..." }
+        statusView = TextView(this).apply { textSize = 13f; text = "Waiting for a MIDI device..." }
 
         val row1 = buttonRow(
             "Organ folder" to { pickFolder() },
-            "Piliin ang .organ" to { chooseOrgan() },
-            "Settings" to { SettingsDialog.show(this, settings) }
+            "Choose .organ" to { chooseOrgan() },
+            "Settings" to { SettingsDialog.show(this, settings) { c.repushTremulants() } }
         )
         val row2 = buttonRow(
             "Stops" to { StopsPanel(this, c).show() },
@@ -257,7 +272,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         // Maliit na quick panel: organ file, manual, transpose, master volume
         organInfo = TextView(this).apply {
             textSize = 13f; setTypeface(typeface, Typeface.BOLD)
-            text = "Wala pang organ na naka-load."
+            text = "No organ loaded yet."
             setOnClickListener { chooseOrgan() }
         }
         manualSpinner = Spinner(this)
@@ -281,6 +296,27 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         }
         val panicRow = buttonRow("PANIC (All Notes Off)" to { c.panic() })
 
+        // Dynamics presets: tap = recall, hold = save the current registration
+        val dynHint = TextView(this).apply { textSize = 11f; text = "Dynamics:  tap = recall,  hold = save" }
+        val dynRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            for (id in OrganController.DYNAMICS) {
+                addView(UiKit.button(context, id) {
+                    if (c.hasPreset(id)) c.recallPreset(id)
+                    else Toast.makeText(context, "${OrganController.presetName(id)} is empty. Hold the button to save.", Toast.LENGTH_SHORT).show()
+                }.apply {
+                    setOnLongClickListener { confirmSave(id); true }
+                }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            }
+        }
+        val version = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (e: Exception) { "" }
+        val footer = TextView(this).apply {
+            text = "Organ Player v$version   \u00B7   \u00A9 2026 Ariel Pagal"
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, 0)
+        }
+
         logView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f; setTextIsSelectable(true) }
         logScroll = ScrollView(this).apply { addView(logView) }
 
@@ -289,7 +325,10 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         root.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(quick, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) })
         root.addView(panicRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(dynHint, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(4) })
+        root.addView(dynRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         setContentView(root)
     }
 

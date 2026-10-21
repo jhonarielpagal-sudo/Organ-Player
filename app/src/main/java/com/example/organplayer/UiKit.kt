@@ -107,9 +107,9 @@ object MidiLearn {
         c.midiMap.learning = action
         val dlg = AlertDialog.Builder(act)
             .setTitle("MIDI mapping")
-            .setMessage("$title\n\nPindutin ang key / piston / knob sa MIDI device para i-assign dito.")
-            .setNeutralButton("Burahin ang mapping") { _, _ -> c.midiMap.clear(action) }
-            .setNegativeButton("Kanselahin", null)
+            .setMessage("$title\n\nPress a key, piston or knob on your MIDI device to assign it.")
+            .setNeutralButton("Clear mapping") { _, _ -> c.midiMap.clear(action) }
+            .setNegativeButton("Cancel", null)
             .create()
         c.midiMap.onLearned = { dlg.dismiss() }
         dlg.setOnDismissListener {

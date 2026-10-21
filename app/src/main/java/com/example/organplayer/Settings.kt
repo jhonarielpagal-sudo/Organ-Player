@@ -3,7 +3,7 @@ package com.example.organplayer
 import android.content.Context
 import kotlin.math.ln
 
-/** General settings (naka-save sa SharedPreferences). Walang hard-coded na gain/buffer/release. */
+/** General settings (saved in SharedPreferences). */
 class Settings(context: Context) {
     private val p = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
@@ -23,12 +23,17 @@ class Settings(context: Context) {
         set(v) { field = v; p.edit().putInt("velsens", v).apply() }
     @Volatile var maxVoices: Int = p.getInt("voices", 256)
         set(v) { field = v; p.edit().putInt("voices", v).apply() }
+    @Volatile var tremSpeed: Int = p.getInt("tremspeed", 100)         // % of the speed written in the ODF
+        set(v) { field = v; p.edit().putInt("tremspeed", v).apply() }
+    @Volatile var tremDepth: Int = p.getInt("tremdepth", 100)         // % of the depth written in the ODF
+        set(v) { field = v; p.edit().putInt("tremdepth", v).apply() }
     @Volatile var memCapMb: Int = p.getInt("memcap", 700)
         set(v) { field = v; p.edit().putInt("memcap", v).apply() }
 
     fun reset() {
         masterVolume = 50; bufferBursts = 2; attackMs = 4; releaseMs = 120; transpose = 0
         tuningA4 = 440; velocitySens = 0; maxVoices = 256; memCapMb = 700
+        tremSpeed = 100; tremDepth = 100
     }
 
     fun applyToEngine() {
