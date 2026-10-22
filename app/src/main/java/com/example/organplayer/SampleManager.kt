@@ -2,9 +2,12 @@ package com.example.organplayer
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
+import java.io.File
 import android.util.Log
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -16,12 +19,26 @@ class SampleManager(
     private val folder: OrganFolder,
     private val baseDirId: String,
     private val organ: Organ,
-    private val settings: Settings
+    private val settings: Settings,
+    private val cache: SampleCache? = null,
+    private val cacheTag: String = ""
 ) {
     class Report(
         val loaded: Int, val failed: Int, val shared: Int, val unresolved: Int,
-        val reasons: String, val firstError: String?
+        val reasons: String, val firstError: String?, val timing: String = ""
     )
+
+    /** Where the loading time goes (summed over the worker threads). */
+    private class Timing {
+        val resolveNs = AtomicLong(); val openNs = AtomicLong(); val nativeNs = AtomicLong()
+        val bytes = AtomicLong(); val hits = AtomicInteger(); val stored = AtomicInteger()
+        fun summary(n: Int): String {
+            if (n == 0) return ""
+            fun ms(v: AtomicLong) = "%.1f".format(v.get() / 1e6 / n)
+            return "per file avg: find ${ms(resolveNs)} ms, open/copy ${ms(openNs)} ms, decode ${ms(nativeNs)} ms; " +
+                "${bytes.get() / 1_048_576} MB; cache hits ${hits.get()}/$n, newly cached ${stored.get()}"
+        }
+    }
 
     private class Target(val key: Int, val pipe: PipeDef)
 
@@ -84,13 +101,14 @@ class SampleManager(
         val badWav = AtomicInteger(0)
         val other = AtomicInteger(0)
         val firstError = AtomicReference<String?>(null)
+        val tm = Timing()
 
         for (t in toLoad) {
             pool.execute {
                 var code = 0
                 try {
                     if (wanted(t.key)) {
-                        code = loadFile(t, firstError)
+                        code = loadFile(t, firstError, tm)
                         if (code == 0 && !wanted(t.key)) AudioEngine.unloadSample(t.key)   // na-off habang naglo-load
                     }
                 } catch (e: Exception) {
@@ -112,7 +130,7 @@ class SampleManager(
                         "file not found" to notFound.get(), "cannot open" to openFail.get(),
                         "unsupported WAV" to badWav.get(), "other" to other.get()
                     ).filter { it.second > 0 }.joinToString(", ") { "${it.first}: ${it.second}" }
-                    onDone(Report(toLoad.size - failed.get(), failed.get(), shared, unresolved, reasons, firstError.get()))
+                    onDone(Report(toLoad.size - failed.get(), failed.get(), shared, unresolved, reasons, firstError.get(), tm.summary(toLoad.size)))
                 }
             }
         }
@@ -192,20 +210,54 @@ class SampleManager(
         return null
     }
 
-    /** 0 = ok, -1 = walang file, -2 = hindi mabuksan, iba = code mula sa native */
-    private fun loadFile(t: Target, firstError: AtomicReference<String?>): Int {
+    /** 0 = ok, -1 = file not found, -2 = cannot open, other = code from the native decoder */
+    private fun loadFile(t: Target, firstError: AtomicReference<String?>, tm: Timing): Int {
         val path = t.pipe.path ?: return -1
+        val cf: File? = if (cache != null && cache.enabled) cache.fileFor(cacheTag, path) else null
+
+        // 1) already in the app cache: plain file I/O
+        if (cf != null && cf.isFile && cf.length() > 0) {
+            val t0 = System.nanoTime()
+            val cached = try { ParcelFileDescriptor.open(cf, ParcelFileDescriptor.MODE_READ_ONLY) } catch (e: Exception) { null }
+            tm.openNs.addAndGet(System.nanoTime() - t0)
+            if (cached != null) {
+                tm.hits.incrementAndGet(); tm.bytes.addAndGet(cf.length())
+                return decode(t, cached, path, firstError, tm)
+            }
+        }
+
+        // 2) from the organ folder (Storage Access Framework), copying into the cache if enabled
+        val r0 = System.nanoTime()
         val uri = findFile(path)
+        tm.resolveNs.addAndGet(System.nanoTime() - r0)
         if (uri == null) {
             firstError.compareAndSet(null, "File not found: $path")
             return -1
         }
-        val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
+        val o0 = System.nanoTime()
+        var pfd: ParcelFileDescriptor? = null
+        if (cache != null && cf != null && cache.hasRoom()) {
+            val stored = try { context.contentResolver.openInputStream(uri)?.let { cache.store(cf, it) } } catch (e: Exception) { null }
+            if (stored != null) {
+                pfd = try { ParcelFileDescriptor.open(stored, ParcelFileDescriptor.MODE_READ_ONLY) } catch (e: Exception) { null }
+                if (pfd != null) tm.stored.incrementAndGet()
+            }
+        }
+        if (pfd == null) pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
+        tm.openNs.addAndGet(System.nanoTime() - o0)
         if (pfd == null) {
             firstError.compareAndSet(null, "Cannot open: $path")
             return -2
         }
+        tm.bytes.addAndGet(maxOf(0L, pfd.statSize))
+        return decode(t, pfd, path, firstError, tm)
+    }
+
+    private fun decode(t: Target, pfd: ParcelFileDescriptor, path: String,
+                       firstError: AtomicReference<String?>, tm: Timing): Int {
+        val n0 = System.nanoTime()
         val code = AudioEngine.loadSample(t.key, pfd.detachFd(), t.pipe.tuneCents, t.pipe.gainLinear)
+        tm.nativeNs.addAndGet(System.nanoTime() - n0)
         if (code != 0) firstError.compareAndSet(null, "${AudioEngine.lastError()}  [$path]")
         return code
     }

@@ -67,6 +67,12 @@ object MidiMapDialog {
             add("tp-", tr("Transpose -1", "Transpose -1"))
             add("tp0", tr("Transpose 0", "Transpose 0"))
             add("vol", tr("Master volume (CC knob/fader)", "Master volume (CC knob/fader)"))
+            add("rev", tr("Reverb on/off", "Reverb on/off"))
+            add("revlvl", tr("Reverb level (CC knob/fader)", "Reverb level (CC knob/fader)"))
+            add("man+", tr("Next manual (MIDI keyboard plays it)", "Susunod na manual (ito ang tutugtugin)"))
+            add("man-", tr("Previous manual", "Nakaraang manual"))
+            add("tremoff", tr("All tremulants off", "Patayin lahat ng tremulant"))
+            add("cpoff", tr("All couplers off", "Patayin lahat ng coupler"))
             add("preset+", tr("Next preset", "Susunod na preset"))
             add("preset-", tr("Previous preset", "Nakaraang preset"))
             box.addView(UiKit.header(act, tr("Dynamics", "Dynamics")))
@@ -232,8 +238,7 @@ object StopSettingsDialog {
         var sel = c.performer.lastPipeNote.takeIf { it in 0..127 } ?: 60
         val noteLabel = TextView(act).apply { textSize = 13f }
         val listBox = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
-        lateinit var centsField: NumberField
-        lateinit var noteField: NumberField
+        var centsField: NumberField? = null
 
         fun rebuildList() {
             listBox.removeAllViews()
@@ -245,22 +250,23 @@ object StopSettingsDialog {
         fun select(n: Int) {
             sel = n.coerceIn(0, 127)
             noteLabel.text = tr("Selected key: ", "Napiling key: ") + "${noteName(sel)} ($sel)"
-            centsField.setValue(s.pipeCents[sel] ?: 0)
+            centsField?.setValue(s.pipeCents[sel] ?: 0)
         }
 
-        noteField = NumberField(act, tr("Key (MIDI note)", "Key (MIDI note)"), 0, 127, "", sel) { select(it) }
-        centsField = NumberField(act, tr("Key tuning", "Tuning ng key"), -100, 100, "cents", s.pipeCents[sel] ?: 0) { v ->
+        val noteField = NumberField(act, tr("Key (MIDI note)", "Key (MIDI note)"), 0, 127, "", sel) { select(it) }
+        val cf = NumberField(act, tr("Key tuning", "Tuning ng key"), -100, 100, "cents", s.pipeCents[sel] ?: 0) { v ->
             if (v == 0) s.pipeCents.remove(sel) else s.pipeCents[sel] = v
             c.saveStopConfigs(); rebuildList()
         }
-        fields += noteField; fields += centsField
+        centsField = cf
+        fields += noteField; fields += cf
         box.addView(noteField, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = UiKit.dp(act, 8) })
         box.addView(noteLabel)
         box.addView(UiKit.button(act, tr("Use last played key", "Use last played key")) {
             val n = c.performer.lastPipeNote
             if (n in 0..127) { noteField.setValue(n); select(n) }
         })
-        box.addView(centsField, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = UiKit.dp(act, 8) })
+        box.addView(cf, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = UiKit.dp(act, 8) })
         select(sel)
         box.addView(listBox)
         rebuildList()

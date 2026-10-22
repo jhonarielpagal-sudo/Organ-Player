@@ -19,7 +19,7 @@ import android.widget.Button
  * Bawat item ay may MIDI button para sa mapping.
  */
 class StopsPanel(private val act: Activity, private val c: OrganController) {
-    private val dialog = Dialog(act, android.R.style.Theme_Material_Light_NoActionBar)
+    private val dialog = Dialog(act, if (UiKit.dark) android.R.style.Theme_Material_NoActionBar else android.R.style.Theme_Material_Light_NoActionBar)
     private val content = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
     private val scroll = ScrollView(act).apply { addView(content) }
     private lateinit var tabLoaded: Button

@@ -16,6 +16,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 object UiKit {
+    @Volatile var dark = false                     // app theme (set by MainActivity)
     const val AMBER = 0xFFFFB300.toInt()          // "ON" indicator colour (yellow-orange)
 
     fun dp(ctx: Context, v: Int) = (v * ctx.resources.displayMetrics.density).toInt()
@@ -27,7 +28,7 @@ object UiKit {
     }
 
     /** Lights a button amber (selected / on) or returns it to a neutral look. */
-    fun setLit(b: TextView, lit: Boolean, dark: Boolean = false) {
+    fun setLit(b: TextView, lit: Boolean, dark: Boolean = UiKit.dark) {
         val off = if (dark) 0xFF23262D.toInt() else 0xFFE0E0E0.toInt()
         b.background = shape(b.context, if (lit) AMBER else off, if (lit) 0xFFFFD54F.toInt() else 0x33000000, 8)
         b.setTextColor(if (lit) 0xFF1A1200.toInt() else if (dark) 0xFFC9CED6.toInt() else 0xFF111111.toInt())

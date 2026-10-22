@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -48,9 +49,15 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     private var midiRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
         settings = Settings(this)
         Lang.fil = settings.language == "fil"
+        UiKit.dark = when (settings.theme) {
+            "dark" -> true
+            "light" -> false
+            else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        }
+        setTheme(if (UiKit.dark) android.R.style.Theme_Material_NoActionBar else android.R.style.Theme_Material_Light_NoActionBar)
+        super.onCreate(savedInstanceState)
         c = OrganController(this, settings, prefs, { log(it) }, { ui.post(it) })
         buildUi()
         c.addListener { onStateChanged() }
@@ -225,6 +232,10 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         memView.text = "Samples: ${AudioEngine.loadedCount()} " + tr("loaded", "naka-load") +
             " (${AudioEngine.loadedBytes() / 1_048_576} MB)"
         for ((id, b) in dynButtons) UiKit.setLit(b, c.activePreset == id)
+        c.organ?.let { o ->      // keep the Manual selector in sync (MIDI can change the active manual)
+            val idx = o.manuals.indexOfFirst { it === c.performer.activeManual }
+            if (idx >= 0 && manualSpinner.selectedItemPosition != idx) manualSpinner.setSelection(idx, false)
+        }
     }
 
     // ---------------- MIDI callbacks (MIDI thread) ----------------
@@ -303,7 +314,10 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         val hooks = SettingsHooks(
             tremolo = { c.repushTremulants() },
             ui = { applyUiSettings() },
-            language = { ui.post { recreate() } }
+            language = { ui.post { recreate() } },
+            theme = { ui.post { recreate() } },
+            cacheUsedMb = { c.cache.usedBytes() / 1_048_576 },
+            clearCache = { c.cache.clear() }
         )
         val row1 = buttonRow(
             tr("Organ folder", "Organ folder") to { pickFolder() },
@@ -340,7 +354,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
         val quick = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(6), dp(8), dp(6))
-            setBackgroundColor(0x11000000)
+            setBackgroundColor(if (UiKit.dark) 0x22FFFFFF else 0x11000000)
             addView(organInfo)
             addView(manualRow)
             addView(transposeField)

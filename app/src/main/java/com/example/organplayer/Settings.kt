@@ -42,7 +42,15 @@ class Settings(context: Context) {
     @Volatile var reverbPre: Int = p.getInt("revpre", 20)              // ms pre-delay
         set(v) { field = v; p.edit().putInt("revpre", v).apply() }
 
+    // Loading speed
+    @Volatile var sampleCache: Boolean = p.getBoolean("scache", false)
+        set(v) { field = v; p.edit().putBoolean("scache", v).apply() }
+    @Volatile var cacheCapMb: Int = p.getInt("scachecap", 2000)
+        set(v) { field = v; p.edit().putInt("scachecap", v).apply() }
+
     // App behaviour
+    @Volatile var theme: String = p.getString("theme", "system") ?: "system"     // "system" | "light" | "dark"
+        set(v) { field = v; p.edit().putString("theme", v).apply() }
     @Volatile var keepScreenOn: Boolean = p.getBoolean("keepon", true)
         set(v) { field = v; p.edit().putBoolean("keepon", v).apply() }
     @Volatile var backgroundAudio: Boolean = p.getBoolean("bgaudio", true)

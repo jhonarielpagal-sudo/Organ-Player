@@ -21,6 +21,7 @@ class OrganController(
     private val runUi: (Runnable) -> Unit
 ) {
     val performer = Performer(settings)
+    val cache = SampleCache(context, settings)
     val midiMap = MidiMap(prefs)
     @Volatile var organ: Organ? = null
     @Volatile var organId: String = ""
@@ -53,7 +54,7 @@ class OrganController(
         performer.samples = null; performer.organ = null
         samples?.unloadAll()
         organ = o; organId = id
-        val sm = SampleManager(context, f, ref.baseDirId, o, settings)
+        val sm = SampleManager(context, f, ref.baseDirId, o, settings, cache, id)
         samples = sm
         performer.samples = sm; performer.organ = o
         performer.channelMap = loadChannelMap(id)
@@ -102,6 +103,7 @@ class OrganController(
             if (s.loaded) s.ready = true
             log("STOP LOAD $mName: ${s.name} -> ${r.loaded} loaded, ${r.shared} shared, ${r.failed} failed, " +
                 "${r.unresolved} no path/REF, ${System.currentTimeMillis() - t0} ms")
+            if (r.timing.isNotEmpty()) log("  timing: ${r.timing}")
             if (r.reasons.isNotEmpty()) log("  ! ${r.reasons}")
             r.firstError?.let { log("  ! $it") }
             changed()
@@ -136,6 +138,37 @@ class OrganController(
     fun unloadAllStops() { allStops().forEach { doUnload(it) }; changed() }
 
     fun panic() { performer.panic(); log("PANIC") }
+
+    fun toggleReverb() {
+        settings.reverbOn = !settings.reverbOn
+        settings.applyToEngine()
+        log("REVERB ${if (settings.reverbOn) "ON" else "OFF"}")
+        changed()
+    }
+
+    fun setReverbLevel(v: Int) { settings.reverbLevel = v.coerceIn(0, 100); settings.applyToEngine() }
+
+    fun stepManual(dir: Int) {
+        val o = organ ?: return
+        if (o.manuals.isEmpty()) return
+        val cur = o.manuals.indexOfFirst { it === performer.activeManual }.coerceAtLeast(0)
+        val next = o.manuals[(cur + dir + o.manuals.size) % o.manuals.size]
+        setActiveManual(next)
+        log("Active manual: ${next.name}")
+        notifyChanged()
+    }
+
+    fun allTremulantsOff() {
+        organ?.tremulants?.forEach { if (it.on) { it.on = false; pushTrem(it) } }
+        log("ALL TREMULANTS OFF")
+        changed()
+    }
+
+    fun allCouplersOff() {
+        organ?.manuals?.forEach { m -> m.couplers.forEach { it.engaged = false } }
+        log("ALL COUPLERS OFF")
+        changed()
+    }
 
     // ---------------- couplers / tremulants ----------------
 
@@ -399,7 +432,7 @@ class OrganController(
         for (a in actions) {
             when (type) {
                 MidiMap.NOTE -> if (value > 0) run(a, value)
-                MidiMap.CC -> if (a == "vol" || a.startsWith("swell:") || midiMap.rising(a, value)) run(a, value)
+                MidiMap.CC -> if (a == "vol" || a == "revlvl" || a.startsWith("swell:") || midiMap.rising(a, value)) run(a, value)
                 else -> run(a, value)
             }
         }
@@ -413,6 +446,12 @@ class OrganController(
             a == "tp+" -> setTranspose(settings.transpose + 1)
             a == "tp-" -> setTranspose(settings.transpose - 1)
             a == "tp0" -> setTranspose(0)
+            a == "rev" -> toggleReverb()
+            a == "revlvl" -> setReverbLevel(v * 100 / 127)
+            a == "man+" -> stepManual(1)
+            a == "man-" -> stepManual(-1)
+            a == "tremoff" -> allTremulantsOff()
+            a == "cpoff" -> allCouplersOff()
             a == "preset+" -> stepPreset(1)
             a == "preset-" -> stepPreset(-1)
             a.startsWith("swell:") -> swellById(a.substring(6).toIntOrNull())?.let { setSwellPos(it, v * 100 / 127) }

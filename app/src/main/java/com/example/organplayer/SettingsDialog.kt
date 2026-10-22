@@ -14,7 +14,10 @@ import android.widget.TextView
 class SettingsHooks(
     val tremolo: () -> Unit = {},
     val ui: () -> Unit = {},          // keep-screen-on / background audio changed
-    val language: () -> Unit = {}
+    val language: () -> Unit = {},
+    val theme: () -> Unit = {},
+    val cacheUsedMb: () -> Long = { 0L },
+    val clearCache: () -> Unit = {}
 )
 
 /** Settings: type the number (or use - / +). */
@@ -51,6 +54,13 @@ object SettingsDialog {
         }
         box.addView(TextView(act).apply { text = tr("Language", "Wika (Language)"); textSize = 14f })
         box.addView(langSpinner)
+        val themeSpinner = Spinner(act).apply {
+            adapter = ArrayAdapter(act, android.R.layout.simple_spinner_dropdown_item,
+                listOf(tr("Follow system", "Sundin ang system"), tr("Light", "Maliwanag"), tr("Dark", "Madilim")))
+            setSelection(when (s.theme) { "light" -> 1; "dark" -> 2; else -> 0 }, false)
+        }
+        box.addView(TextView(act).apply { text = tr("Theme", "Theme"); textSize = 14f })
+        box.addView(themeSpinner)
         toggle(tr("Keep screen on", "Huwag patayin ang screen"), s.keepScreenOn) { s.keepScreenOn = it; hooks.ui() }
         toggle(tr("Keep playing in the background (foreground service)", "Tuloy ang tunog sa background (foreground service)"), s.backgroundAudio) {
             s.backgroundAudio = it; hooks.ui()
@@ -75,6 +85,17 @@ object SettingsDialog {
         field(tr("Tremulant speed", "Bilis ng tremulant"), 25, 200, "%", s.tremSpeed, 5) { s.tremSpeed = it; hooks.tremolo() }
         field(tr("Tremulant depth", "Lalim ng tremulant"), 0, 300, "%", s.tremDepth, 5) { s.tremDepth = it; hooks.tremolo() }
 
+        box.addView(UiKit.header(act, tr("Loading speed", "Bilis ng loading")))
+        toggle(tr("Cache samples in app storage (faster loading, uses space)",
+            "I-cache ang samples sa app storage (mas mabilis mag-load, gumagamit ng space)"), s.sampleCache) { s.sampleCache = it }
+        field(tr("Cache size limit", "Limit ng cache"), 200, 20000, "MB", s.cacheCapMb, 100) { s.cacheCapMb = it }
+        val cacheInfo = TextView(act).apply { textSize = 12f; text = tr("Cache used: ", "Gamit na cache: ") + "${hooks.cacheUsedMb()} MB" }
+        box.addView(cacheInfo)
+        box.addView(UiKit.button(act, tr("Clear cache", "Burahin ang cache")) {
+            hooks.clearCache()
+            cacheInfo.text = tr("Cache used: ", "Gamit na cache: ") + "${hooks.cacheUsedMb()} MB"
+        })
+
         box.addView(UiKit.header(act, tr("Performance", "Performance")))
         field(tr("Audio buffer", "Audio buffer"), 1, 8, "bursts", s.bufferBursts) { s.bufferBursts = it }
         field(tr("Max simultaneous voices", "Max na sabay-sabay na boses"), 16, 512, "", s.maxVoices, 16) { s.maxVoices = it }
@@ -87,6 +108,19 @@ object SettingsDialog {
             .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine(); hooks.tremolo(); show(act, s, hooks) }
             .create()
         dlg.setOnDismissListener { fields.forEach { it.commit() } }
+        var themeInit = true
+        themeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                if (themeInit) { themeInit = false; return }
+                val code = when (pos) { 1 -> "light"; 2 -> "dark"; else -> "system" }
+                if (code != s.theme) {
+                    s.theme = code
+                    dlg.dismiss()
+                    hooks.theme()
+                }
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
         var langInit = true
         langSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
