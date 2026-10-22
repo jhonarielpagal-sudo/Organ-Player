@@ -245,7 +245,7 @@ object StopSettingsDialog {
         fun select(n: Int) {
             sel = n.coerceIn(0, 127)
             noteLabel.text = tr("Selected key: ", "Napiling key: ") + "${noteName(sel)} ($sel)"
-            if (::centsField.isInitialized) centsField.setValue(s.pipeCents[sel] ?: 0)
+            centsField.setValue(s.pipeCents[sel] ?: 0)
         }
 
         noteField = NumberField(act, tr("Key (MIDI note)", "Key (MIDI note)"), 0, 127, "", sel) { select(it) }

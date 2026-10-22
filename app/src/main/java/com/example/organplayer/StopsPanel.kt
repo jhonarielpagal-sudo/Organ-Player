@@ -76,7 +76,7 @@ class StopsPanel(private val act: Activity, private val c: OrganController) {
             isChecked = checked
             setOnCheckedChangeListener { _, on -> onToggle(on) }
         }
-        return row(sw, action, title, extra)
+        return row(sw, action, title, *extra)
     }
 
     private fun rebuild() {
