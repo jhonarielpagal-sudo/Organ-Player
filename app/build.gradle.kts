@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.organplayer"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         externalNativeBuild {
             cmake {
@@ -23,6 +23,14 @@ android {
     }
 
     buildFeatures { prefab = true }   // kailangan para sa Oboe
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")   // installs directly; replace with your own key for the Play Store
+        }
+    }
+    lint { checkReleaseBuilds = false }
 
     externalNativeBuild {
         cmake {

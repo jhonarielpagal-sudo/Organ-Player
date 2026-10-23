@@ -3,6 +3,7 @@
 #include <oboe/Oboe.h>
 #include <android/log.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -39,6 +40,21 @@ static uint16_t rd16(const uint8_t* p) { return (uint16_t) (p[0] | (p[1] << 8));
 
 static bool readAll(int fd, std::vector<uint8_t>& buf) {
     static constexpr size_t kMaxFile = 256u * 1024u * 1024u;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0 && (size_t) st.st_size <= kMaxFile) {
+        // Known size: read straight into the buffer (no repeated reallocation / extra copy)
+        const size_t cap = (size_t) st.st_size;
+        buf.resize(cap);
+        size_t got = 0;
+        while (got < cap) {
+            ssize_t r = read(fd, buf.data() + got, cap - got);
+            if (r < 0) return false;
+            if (r == 0) break;
+            got += (size_t) r;
+        }
+        buf.resize(got);
+        return got > 0;
+    }
     uint8_t tmp[65536];
     for (;;) {
         ssize_t r = read(fd, tmp, sizeof(tmp));
@@ -112,6 +128,28 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
     auto s = std::make_shared<Sample>();
     s->data.resize(frames);
     s->sampleRate = (int) rate;
+    int16_t* dst = s->data.data();
+    if (isPcm && channels == 1 && (bits == 16 || bits == 24)) {
+        // Fast path for the common mono files
+        if (bits == 16) {
+            for (size_t f = 0; f < frames; ++f) dst[f] = (int16_t) rd16(pcm + f * 2);
+        } else {
+            for (size_t f = 0; f < frames; ++f) dst[f] = (int16_t) rd16(pcm + f * 3 + 1);
+        }
+    } else if (isPcm && channels == 2 && (bits == 16 || bits == 24)) {
+        // Fast path for stereo files (averaged to mono)
+        if (bits == 16) {
+            for (size_t f = 0; f < frames; ++f) {
+                const int l = (int16_t) rd16(pcm + f * 4), r = (int16_t) rd16(pcm + f * 4 + 2);
+                dst[f] = (int16_t) ((l + r) / 2);
+            }
+        } else {
+            for (size_t f = 0; f < frames; ++f) {
+                const int l = (int16_t) rd16(pcm + f * 6 + 1), r = (int16_t) rd16(pcm + f * 6 + 4);
+                dst[f] = (int16_t) ((l + r) / 2);
+            }
+        }
+    } else
     for (size_t f = 0; f < frames; ++f) {
         int sum = 0;
         for (uint16_t ch = 0; ch < channels; ++ch) {

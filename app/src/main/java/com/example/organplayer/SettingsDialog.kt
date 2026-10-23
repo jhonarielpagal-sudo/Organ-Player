@@ -28,14 +28,24 @@ object SettingsDialog {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-        val info = TextView(act).apply { textSize = 12f; text = AudioEngine.info() }
+        val deviceLine = run {
+            val pm = act.packageManager
+            val mi = android.app.ActivityManager.MemoryInfo()
+            (act.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager).getMemoryInfo(mi)
+            "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}), " +
+                "${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}, ${mi.totalMem / 1_048_576} MB RAM, " +
+                "${Runtime.getRuntime().availableProcessors()} cores\n" +
+                "Low-latency audio: " + (if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_AUDIO_LOW_LATENCY)) "yes" else "no") +
+                ",  Pro audio: " + (if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_AUDIO_PRO)) "yes" else "no") + "\n"
+        }
+        val info = TextView(act).apply { textSize = 12f; text = deviceLine + AudioEngine.info() }
         box.addView(info)
         val fields = ArrayList<NumberField>()
         val lp = { LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = UiKit.dp(act, 10) } }
 
         fun field(label: String, min: Int, max: Int, unit: String, value: Int, step: Int = 1, onChange: (Int) -> Unit) {
             val f = NumberField(act, label, min, max, unit, value, step) { v ->
-                onChange(v); s.applyToEngine(); info.text = AudioEngine.info()
+                onChange(v); s.applyToEngine(); info.text = deviceLine + AudioEngine.info()
             }
             fields += f
             box.addView(f, lp())

@@ -42,7 +42,7 @@ class SampleManager(
 
     private class Target(val key: Int, val pipe: PipeDef)
 
-    private val pool = Executors.newFixedThreadPool(3)
+    private val pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors().coerceIn(2, 4))
     private val lock = Any()
     private val refs = HashMap<Int, Int>()
 
