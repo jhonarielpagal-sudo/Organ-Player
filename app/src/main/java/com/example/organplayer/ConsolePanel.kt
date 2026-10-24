@@ -278,7 +278,8 @@ class ConsolePanel(private val act: Activity, private val c: OrganController, pr
             specs += RowSpec(m.name, items)
         }
         // Tremulants that no visible manual row carries stay reachable in their own row
-        val leftover = o.tremulants.filter { it.id !in shownTrem }
+        val linked = o.manuals.filter { !it.isPedal }.flatMap { c.tremulantsFor(it) }.map { it.id }.toSet()
+        val leftover = o.tremulants.filter { it.id !in shownTrem && it.id in linked }
         if (leftover.isNotEmpty()) specs += RowSpec("TREM", leftover.map { tremItem(it) })
 
         if (specs.isEmpty()) {

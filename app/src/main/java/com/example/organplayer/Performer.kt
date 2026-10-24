@@ -5,7 +5,12 @@ import java.util.TreeSet
 /**
  * Playing logic (MIDI thread + UI thread, so synchronized):
  *  - unison + NORMAL couplers
- *  - MELODY coupler: only the highest held note sounds; BASS coupler: only the lowest
+ *  - MELODY coupler: follows ONE key, the top note of the right hand. A key becomes the melody when it is
+ *    pressed above every key that is held at that moment. When the melody key is released, the melody passes
+ *    only to a key that was pressed just before that (within the "handover" time in Settings = a legato
+ *    overlap of the next soprano note). A key that has been held for longer (the alto) is never promoted, so
+ *    in the small gap between two soprano notes the coupler goes quiet instead of jumping to the alto.
+ *    BASS coupler: the same, mirrored (lowest key; a tenor is never promoted to bass).
  *  - MIDI channel -> manual
  *  - refreshAll(): changing stops/couplers while keys are held updates the held notes immediately
  *
@@ -28,6 +33,11 @@ class Performer(private val settings: Settings) {
     private val owner = HashMap<Int, Int>()                       // channel*128+note -> manual
     private val unison = HashMap<Int, SampleManager.Hits>()       // manual*128+note -> sounding pipes
     private val special = HashMap<Int, Special>()                 // coupler id -> sounding pipes
+    private var seqCounter = 0L
+    private val pressSeq = HashMap<Int, Long>()                   // manual*128+note -> order of pressing
+    private val pressNs = HashMap<Int, Long>()                    // manual*128+note -> time of pressing
+    private val melodyKey = HashMap<Int, Int>()                   // manual -> note that the MELODY coupler follows
+    private val bassKey = HashMap<Int, Int>()                     // manual -> note that the BASS coupler follows
 
     private fun manualFor(ch: Int): Manual? {
         val o = organ ?: return null
@@ -63,7 +73,12 @@ class Performer(private val settings: Settings) {
         val id = m.index * 128 + note
         unison.remove(id)?.let { release(it, id) }                // re-strike
         owner[channel * 128 + note] = m.index
-        held.getOrPut(m.index) { TreeSet() }.add(note)
+        val set = held.getOrPut(m.index) { TreeSet() }
+        pressSeq[id] = ++seqCounter
+        pressNs[id] = System.nanoTime()
+        if (set.isEmpty() || note > set.last()) melodyKey[m.index] = note     // new top note = melody
+        if (set.isEmpty() || note < set.first()) bassKey[m.index] = note      // new bottom note = bass
+        set.add(note)
         vels[id] = vel
         lastPipeNote = note + settings.transpose
         lastManualIndex = m.index
@@ -78,7 +93,20 @@ class Performer(private val settings: Settings) {
     fun noteOff(channel: Int, note: Int): Boolean {
         val mi = owner.remove(channel * 128 + note) ?: return false
         val id = mi * 128 + note
-        held[mi]?.remove(note)
+        val set = held[mi]
+        set?.remove(note)
+        val mySeq = pressSeq.remove(id) ?: 0L
+        pressNs.remove(id)
+        if (set != null && (melodyKey[mi] == note || bassKey[mi] == note)) {
+            val now = System.nanoTime()
+            val windowNs = settings.handoverMs * 1_000_000L
+            // a key may take over only if it was pressed after the released one AND just before this release
+            val heirs = set.filter {
+                (pressSeq[mi * 128 + it] ?: 0L) > mySeq && now - (pressNs[mi * 128 + it] ?: 0L) <= windowNs
+            }
+            if (melodyKey[mi] == note) { val h = heirs.maxOrNull(); if (h != null) melodyKey[mi] = h else melodyKey.remove(mi) }
+            if (bassKey[mi] == note) { val h = heirs.minOrNull(); if (h != null) bassKey[mi] = h else bassKey.remove(mi) }
+        }
         vels.remove(id)
         unison.remove(id)?.let { release(it, id) }
         organ?.manuals?.firstOrNull { it.index == mi }?.let { updateSpecial(it, false) }
@@ -115,8 +143,8 @@ class Performer(private val settings: Settings) {
             val cur = special[c.id]
             val target: Int? = when {
                 !c.engaged || set == null || set.isEmpty() -> null
-                c.kind == CouplerKind.MELODY -> set.last()
-                else -> set.first()
+                c.kind == CouplerKind.MELODY -> melodyKey[m.index]?.takeIf { it in set }
+                else -> bassKey[m.index]?.takeIf { it in set }
             }
             if (cur == null && target == null) continue
             val dest = o.manuals.firstOrNull { it.index == c.destManual }
@@ -141,6 +169,7 @@ class Performer(private val settings: Settings) {
     @Synchronized
     fun panic() {
         unison.clear(); special.clear(); held.clear(); vels.clear(); owner.clear()
+        pressSeq.clear(); pressNs.clear(); melodyKey.clear(); bassKey.clear()
         AudioEngine.panic()
     }
 }

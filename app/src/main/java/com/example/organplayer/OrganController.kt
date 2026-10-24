@@ -201,6 +201,7 @@ class OrganController(
     /** Tremulants that act on this manual (any of its ranks sits on a windchest with that tremulant). */
     fun tremulantsFor(m: Manual): List<Tremulant> {
         val o = organ ?: return emptyList()
+        if (m.isPedal) return emptyList()                 // the pedal has no tremulant
         var mask = 0
         for (s in m.stops) for (r in s.ranks) mask = mask or r.rank.tremMask
         return o.tremulants.filter { (mask and (1 shl it.slot)) != 0 }

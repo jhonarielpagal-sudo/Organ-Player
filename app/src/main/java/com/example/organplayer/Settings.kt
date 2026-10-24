@@ -42,6 +42,10 @@ class Settings(context: Context) {
     @Volatile var reverbPre: Int = p.getInt("revpre", 20)              // ms pre-delay
         set(v) { field = v; p.edit().putInt("revpre", v).apply() }
 
+    // Melody / Bass coupler: how soon after a new key is pressed the old melody key may hand over to it
+    @Volatile var handoverMs: Int = p.getInt("handover", 100)
+        set(v) { field = v; p.edit().putInt("handover", v).apply() }
+
     // Impulse response (the IR file itself, its on/off and level are saved per organ)
     @Volatile var irMaxMs: Int = p.getInt("irmax", 3000)               // longest IR used (longer = more CPU)
         set(v) { field = v; p.edit().putInt("irmax", v).apply() }
@@ -73,7 +77,7 @@ class Settings(context: Context) {
         tuningA4 = 440; velocitySens = 0; maxVoices = 256; memCapMb = 700
         tremSpeed = 100; tremDepth = 100
         reverbOn = false; reverbLevel = 25; reverbRoom = 60; reverbDamp = 50; reverbPre = 20
-        irMaxMs = 3000; autoReedColor = true; reedWords = DEFAULT_REED_WORDS
+        handoverMs = 100; irMaxMs = 3000; autoReedColor = true; reedWords = DEFAULT_REED_WORDS
     }
 
     companion object {

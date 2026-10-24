@@ -97,6 +97,15 @@ object SettingsDialog {
         field(tr("Damping (darker tail)", "Damping (mas madilim na tail)"), 0, 100, "%", s.reverbDamp, 5) { s.reverbDamp = it }
         field(tr("Pre-delay", "Pre-delay"), 0, 250, "ms", s.reverbPre, 5) { s.reverbPre = it }
 
+        // ---- Couplers ----
+        box.addView(UiKit.header(act, tr("Melody / Bass coupler", "Melody / Bass coupler")))
+        field(tr("Handover time", "Handover time"), 0, 300, "ms", s.handoverMs, 10) { s.handoverMs = it }
+        box.addView(TextView(act).apply {
+            textSize = 11f
+            text = tr("Melody follows the top key, Bass the lowest key. When that key is lifted, only a key pressed within this time before (the next legato note) takes over; a held alto or tenor never does. 0 = never hand over.",
+                "Sinusundan ng Melody ang pinakamataas na key, ng Bass ang pinakamababa. Kapag binitawan iyon, tanging key na pinindot sa loob ng oras na ito bago iyon (ang susunod na legato note) ang hahalili; hindi kailanman ang nakahawak na alto o tenor. 0 = walang hahalili.")
+        })
+
         // ---- Impulse response (convolution reverb) ----
         var dlgRef: AlertDialog? = null
         box.addView(UiKit.header(act, tr("Impulse response (this organ)", "Impulse response (para sa organ na ito)")))

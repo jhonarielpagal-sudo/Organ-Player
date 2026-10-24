@@ -640,7 +640,15 @@ public:
         renderSamples(out, numFrames);
         if (!processIr(out, numFrames)) processReverb(out, numFrames);
 
-        for (int i = 0; i < numFrames; ++i) out[i] = std::tanh(out[i]);   // soft limiter
+        float pk = 0.0f;
+        for (int i = 0; i < numFrames; ++i) {
+            const float a = std::fabs(out[i]);
+            if (a > pk) pk = a;
+            out[i] = std::tanh(out[i]);                                     // soft limiter
+        }
+        if (pk > mPeak.load(std::memory_order_relaxed)) mPeak.store(pk, std::memory_order_relaxed);
+        const int nv = (int) mVoices.size();
+        if (nv > mVoicePeak.load(std::memory_order_relaxed)) mVoicePeak.store(nv, std::memory_order_relaxed);
         return oboe::DataCallbackResult::Continue;
     }
 
@@ -676,11 +684,19 @@ private:
 
     std::string infoLocked() {
         if (!mStream) return "Audio stopped";
-        char buf[200];
-        snprintf(buf, sizeof(buf), "Audio: %s, %d Hz, burst %d, buffer %d frames (~%.1f ms)",
+        char buf[420];
+        const auto xr = mStream->getXRunCount();
+        const int xruns = xr ? xr.value() : -1;
+        const float peak = mPeak.exchange(0.0f);          // since the last time this was read
+        const int vpeak = mVoicePeak.exchange(0);
+        int n = snprintf(buf, sizeof(buf), "Audio: %s, %d Hz, burst %d, buffer %d frames (~%.1f ms)"
+                 "\nxruns (glitches): %d | voices: peak %d of %zu max, dropped %d | peak level %.2f",
                  oboe::convertToText(mStream->getAudioApi()), mStream->getSampleRate(),
                  mStream->getFramesPerBurst(), mStream->getBufferSizeInFrames(),
-                 mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate());
+                 mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate(),
+                 xruns, vpeak, mMaxVoices.load(), mDropped.load(), (double) peak);
+        if (peak > 1.0f && n > 0 && n < (int) sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - (size_t) n, " (over 1.0: the soft limiter is squashing the sound - lower Master volume)");
         return buf;
     }
 
@@ -712,6 +728,8 @@ private:
                     v.group = std::min(kMaxGroups - 1, std::max(0, c.group));
                     v.relStep = c.relMs > 0.0f ? 1.0f / (c.relMs * 0.001f * mSampleRate) : 0.0f;
                     mVoices.push_back(std::move(v));
+                } else if (c.s) {
+                    mDropped.fetch_add(1, std::memory_order_relaxed);   // voice cap reached: this pipe stays silent
                 }
             } else if (c.type == 1) {
                 for (auto& v : mVoices) if (v.key == c.key && v.tag == c.tag) v.releasing = true;
@@ -1054,6 +1072,11 @@ private:
     size_t mPreIdx = 0;
     float mRevMixCur = 0.0f;
     bool mRevIdle = true;
+
+    // diagnostics (shown in Settings > audio info)
+    std::atomic<float> mPeak{0.0f};
+    std::atomic<int> mVoicePeak{0};
+    std::atomic<int> mDropped{0};
 
     // impulse response
     Fft mFft;

@@ -172,7 +172,7 @@ class SampleManager(
             for (r in s.ranks) {
                 if (k < r.firstAccessibleKey || k >= r.firstAccessibleKey + r.pipeCount) continue
                 val t = target(r.rank, r.firstPipeNumber + (k - r.firstAccessibleKey)) ?: continue
-                val p = PipeInfo(t.key, r.rank.tremMask, s.tag, minOf(15, manual.index), gain, cents, s.releaseMs.toFloat())
+                val p = PipeInfo(t.key, if (manual.isPedal) 0 else r.rank.tremMask, s.tag, minOf(15, manual.index), gain, cents, s.releaseMs.toFloat())
                 if (!out.containsKey(p.id)) out[p.id] = p
             }
         }
