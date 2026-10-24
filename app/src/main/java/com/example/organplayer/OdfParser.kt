@@ -28,10 +28,16 @@ class Stop(val id: Int, val name: String, val ranks: List<StopRank>) {
     @Volatile var releaseMs = 0          // 0 = use the global release
     @Volatile var tuneCents = 0          // whole-stop tuning
     val pipeCents = java.util.concurrent.ConcurrentHashMap<Int, Int>()   // sounding note -> cents (single pipe)
+    @Volatile var textColor = COLOR_AUTO // text colour in the console: COLOR_AUTO / COLOR_PLAIN / an ARGB colour
     @Volatile var manualIndex = -1
     @Volatile var status = ""
     val key: String get() = "$manualIndex.$id"
     val pipeCount: Int get() = ranks.sumOf { it.pipeCount }
+
+    companion object {
+        const val COLOR_AUTO = 0     // reeds are red (if enabled in Settings), everything else normal
+        const val COLOR_PLAIN = 1    // always the normal colour
+    }
 }
 
 enum class CouplerKind { NORMAL, MELODY, BASS }

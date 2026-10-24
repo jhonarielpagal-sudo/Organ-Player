@@ -28,6 +28,13 @@ object AudioEngine {
         nativeSetReverb(on, level, room, damp, preMs)
     fun panic() = nativePanic()
 
+    // Impulse response (convolution reverb). Native closes the fd. Return: 0 = ok, 1 = cannot read, 2 = bad WAV
+    fun loadIr(fd: Int, maxMs: Int): Int = nativeLoadIr(fd, maxMs)
+    fun rebuildIr(maxMs: Int): Int = nativeRebuildIr(maxMs)
+    fun clearIr() = nativeClearIr()
+    fun setIr(on: Boolean, level: Float) = nativeSetIr(on, level)
+    fun irInfo(): String = nativeIrInfo()
+
     // Tremulant slots (0..31): amplitude + bahagyang pitch wobble
     fun setTremulant(slot: Int, on: Boolean, periodMs: Float, depthPct: Float, startMs: Float, stopMs: Float) =
         nativeSetTremulant(slot, on, periodMs, depthPct, startMs, stopMs)
@@ -56,6 +63,11 @@ object AudioEngine {
     private external fun nativeSetGroupGain(group: Int, gain: Float)
     private external fun nativeSetReverb(on: Boolean, level: Float, room: Float, damp: Float, preMs: Float)
     private external fun nativePanic()
+    private external fun nativeLoadIr(fd: Int, maxMs: Int): Int
+    private external fun nativeRebuildIr(maxMs: Int): Int
+    private external fun nativeClearIr()
+    private external fun nativeSetIr(on: Boolean, level: Float)
+    private external fun nativeIrInfo(): String
     private external fun nativeSetTremulant(slot: Int, on: Boolean, periodMs: Float, depthPct: Float, startMs: Float, stopMs: Float)
     private external fun nativeClearTremulants()
     private external fun nativePipeOff(key: Int, tag: Int)

@@ -2,15 +2,21 @@ package com.example.organplayer
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.Uri
+import android.provider.OpenableColumns
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Swell / expression shoe: controls the volume of the chosen manuals. Created by the user, saved per organ. */
 class Swell(val id: Int, var name: String, var manuals: Set<Int>, var minPct: Int) {
     @Volatile var pos = 100        // 0..100 (current shoe position)
 }
+
+/** Impulse response (convolution reverb) of one organ. Saved per organ. */
+class IrConfig(var uri: String? = null, var name: String = "", var on: Boolean = false, var level: Int = 40)
 
 /** Hawak ang estado ng organ: stops (load/mute), couplers, tremulants, presets, MIDI actions, save/restore. */
 class OrganController(
@@ -33,6 +39,17 @@ class OrganController(
     private val swellPosted = AtomicBoolean(false)
     @Volatile var activePreset: String? = null
     private var lastStepped: String? = null
+
+    // MIDI keyboards (connected names + time of the last MIDI message, for the console indicator)
+    @Volatile var midiDevices: List<String> = emptyList()
+    @Volatile var midiActivityNs = 0L
+    fun pulseMidi() { midiActivityNs = System.nanoTime() }
+
+    // Impulse response of the current organ
+    @Volatile var ir = IrConfig()
+    @Volatile var irStatus = ""
+    private val irExec = Executors.newSingleThreadExecutor()
+    @Volatile private var irGen = 0
 
     fun addListener(l: () -> Unit) { listeners.add(l) }
     fun removeListener(l: () -> Unit) { listeners.remove(l) }
@@ -66,6 +83,8 @@ class OrganController(
         loadStopConfigs()
         loadSwells()
         applySwells()
+        loadIrConfig()
+        startIrLoad()
         AudioEngine.clearTremulants()
         o.tremulants.forEach { pushTrem(it) }
         for (m in o.manuals) for (c in m.couplers) {
@@ -179,6 +198,14 @@ class OrganController(
         changed()
     }
 
+    /** Tremulants that act on this manual (any of its ranks sits on a windchest with that tremulant). */
+    fun tremulantsFor(m: Manual): List<Tremulant> {
+        val o = organ ?: return emptyList()
+        var mask = 0
+        for (s in m.stops) for (r in s.ranks) mask = mask or r.rank.tremMask
+        return o.tremulants.filter { (mask and (1 shl it.slot)) != 0 }
+    }
+
     /** Constant speed and depth from start to release (fast fixed fade only to avoid clicks). */
     private fun pushTrem(t: Tremulant) {
         val speed = settings.tremSpeed.coerceAtLeast(10) / 100f
@@ -198,6 +225,7 @@ class OrganController(
     // ---------------- settings na ginagamit sa quick panel / MIDI ----------------
 
     fun setTranspose(v: Int) { settings.transpose = v.coerceIn(-12, 12); settings.applyToEngine(); changed() }
+    fun setPitch(v: Int) { settings.tuningA4 = v.coerceIn(415, 466); settings.applyToEngine(); changed() }
     fun setVolume(v: Int) { settings.masterVolume = v.coerceIn(0, 100); settings.applyToEngine(); changed() }
 
     // ---------------- state / presets ----------------
@@ -308,8 +336,8 @@ class OrganController(
         if (organ == null) return
         val j = JSONObject()
         for (s in allStops()) {
-            if (s.gainPct == 100 && s.releaseMs == 0 && s.tuneCents == 0 && s.pipeCents.isEmpty()) continue
-            val o = JSONObject().put("g", s.gainPct).put("r", s.releaseMs).put("c", s.tuneCents)
+            if (s.gainPct == 100 && s.releaseMs == 0 && s.tuneCents == 0 && s.pipeCents.isEmpty() && s.textColor == Stop.COLOR_AUTO) continue
+            val o = JSONObject().put("g", s.gainPct).put("r", s.releaseMs).put("c", s.tuneCents).put("tc", s.textColor)
             val p = JSONObject()
             for ((n, cents) in s.pipeCents) p.put(n.toString(), cents)
             o.put("p", p)
@@ -326,10 +354,105 @@ class OrganController(
                 val s = stopByKey(k) ?: continue
                 val o = j.getJSONObject(k)
                 s.gainPct = o.optInt("g", 100); s.releaseMs = o.optInt("r", 0); s.tuneCents = o.optInt("c", 0)
+                s.textColor = o.optInt("tc", Stop.COLOR_AUTO)
                 s.pipeCents.clear()
                 o.optJSONObject("p")?.let { p -> for (n in p.keys()) s.pipeCents[n.toInt()] = p.getInt(n) }
             }
         } catch (_: Exception) { }
+    }
+
+    // ---------------- stop text colours (console) ----------------
+
+    private fun reedWordList(): List<String> =
+        settings.reedWords.split(',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+
+    fun isReed(name: String, words: List<String> = reedWordList()): Boolean {
+        val n = name.lowercase()
+        return words.any { n.contains(it) }
+    }
+
+    /** Text colour of a stop in the console. 0 = normal. */
+    fun stopTextColor(s: Stop, words: List<String> = reedWordList()): Int = when {
+        s.textColor == Stop.COLOR_PLAIN -> 0
+        s.textColor != Stop.COLOR_AUTO -> s.textColor
+        settings.autoReedColor && isReed(s.name, words) -> REED_RED
+        else -> 0
+    }
+
+    // ---------------- impulse response (per organ) ----------------
+
+    private fun loadIrConfig() {
+        ir = IrConfig()
+        val txt = prefs.getString("ir_$organId", null) ?: return
+        try {
+            val j = JSONObject(txt)
+            ir = IrConfig(j.optString("uri", "").ifEmpty { null }, j.optString("name", ""), j.optBoolean("on", false), j.optInt("level", 40))
+        } catch (_: Exception) { }
+    }
+
+    private fun saveIrConfig() {
+        if (organ == null) return
+        val j = JSONObject().put("uri", ir.uri ?: "").put("name", ir.name).put("on", ir.on).put("level", ir.level)
+        prefs.edit().putString("ir_$organId", j.toString()).apply()
+    }
+
+    /** Sends on/off + level to the engine (call after the engine starts, too). */
+    fun applyIr() { AudioEngine.setIr(ir.on && ir.uri != null, ir.level / 100f) }
+
+    /** (Re)loads the IR file of the current organ on a background thread; the newest request wins. */
+    private fun startIrLoad() {
+        val gen = ++irGen
+        val uri = ir.uri
+        applyIr()
+        irExec.execute {
+            if (gen != irGen) return@execute
+            if (uri == null) { AudioEngine.clearIr(); irStatus = ""; return@execute }
+            try {
+                val pfd = context.contentResolver.openFileDescriptor(Uri.parse(uri), "r")
+                    ?: throw java.io.IOException("cannot open the file")
+                val code = AudioEngine.loadIr(pfd.detachFd(), settings.irMaxMs)
+                irStatus = if (code == 0) AudioEngine.irInfo() else AudioEngine.lastError()
+                log(if (code == 0) irStatus else "IR load failed: $irStatus")
+            } catch (e: Exception) {
+                irStatus = e.message ?: "error"
+                log("IR load failed: $irStatus")
+            }
+            runUi(Runnable { applyIr(); notifyChanged() })
+        }
+    }
+
+    fun setIrFile(uri: Uri) {
+        if (organ == null) { log("Load an organ first."); return }
+        var name = uri.lastPathSegment ?: "IR"
+        try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) it.getString(0)?.let { n -> name = n }
+            }
+        } catch (_: Exception) { }
+        ir = IrConfig(uri.toString(), name, true, ir.level)
+        saveIrConfig()
+        startIrLoad()
+        notifyChanged()
+    }
+
+    fun clearIrFile() {
+        ir = IrConfig(null, "", false, ir.level)
+        saveIrConfig()
+        startIrLoad()
+        notifyChanged()
+    }
+
+    fun setIrOn(on: Boolean) { ir.on = on; saveIrConfig(); applyIr(); notifyChanged() }
+    fun setIrLevel(v: Int) { ir.level = v.coerceIn(0, 100); saveIrConfig(); applyIr() }
+
+    /** The max IR length changed in Settings: rebuild the convolver from the stored IR. */
+    fun rebuildIr() {
+        if (ir.uri == null) return
+        irExec.execute {
+            AudioEngine.rebuildIr(settings.irMaxMs)
+            irStatus = AudioEngine.irInfo()
+            runUi(Runnable { notifyChanged() })
+        }
     }
 
     // ---------------- swell / expression ----------------
@@ -464,6 +587,7 @@ class OrganController(
     }
 
     companion object {
+        const val REED_RED = 0xFFFF5A5F.toInt()
         val DYNAMICS = listOf("P", "MP", "MF", "F", "T")
         val NUMBERED = (1..16).map { it.toString() }
         fun presetName(id: String) = when (id) {

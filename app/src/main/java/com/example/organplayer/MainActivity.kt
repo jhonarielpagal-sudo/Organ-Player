@@ -35,6 +35,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     private lateinit var logScroll: ScrollView
     private lateinit var manualSpinner: Spinner
     private lateinit var transposeField: NumberField
+    private lateinit var pitchField: NumberField
     private lateinit var volumeField: NumberField
     private lateinit var settings: Settings
     private lateinit var c: OrganController
@@ -85,6 +86,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             settings.applyToEngine()
             c.applySwells()
             c.repushTremulants()
+            c.applyIr()
         }
         if (!midiRunning && midi != null) { midi?.start(); midiRunning = true }
         if (settings.backgroundAudio) AudioService.start(this)
@@ -137,6 +139,20 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             prefs.edit().putString(KEY_TREE, uri.toString()).remove(KEY_ORGAN).apply()
             loadFolder(uri)
         }
+        if (requestCode == REQ_IR && resultCode == RESULT_OK && uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: Exception) { Log.w(TAG, "persist failed", e) }
+            c.setIrFile(uri)
+        }
+    }
+
+    private fun pickIrFile() {
+        if (c.organ == null) { onStatus(tr("Load an organ first.", "Mag-load muna ng organ.")); return }
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        ).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE)
+        @Suppress("DEPRECATION") startActivityForResult(i, REQ_IR)
     }
 
     private fun organId(r: OrganFolder.OrganRef) = "${r.dirName}/${r.name}"
@@ -228,6 +244,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     /** Called whenever something changes (UI, MIDI, loading). */
     private fun onStateChanged() {
         transposeField.setValue(settings.transpose)
+        pitchField.setValue(settings.tuningA4)
         volumeField.setValue(settings.masterVolume)
         memView.text = "Samples: ${AudioEngine.loadedCount()} " + tr("loaded", "naka-load") +
             " (${AudioEngine.loadedBytes() / 1_048_576} MB)"
@@ -241,6 +258,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     // ---------------- MIDI callbacks (MIDI thread) ----------------
 
     override fun onNoteOn(channel: Int, note: Int, velocity: Int, lagMs: Double) {
+        c.pulseMidi()
         if (c.onMidi(MidiMap.NOTE, channel, note, velocity)) return
         if (!c.performer.noteOn(channel, note, velocity)) {
             AudioEngine.noteOn(note, velocity)      // no organ loaded: wavetable test sound
@@ -249,6 +267,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     }
 
     override fun onNoteOff(channel: Int, note: Int, velocity: Int, lagMs: Double) {
+        c.pulseMidi()
         if (c.onMidi(MidiMap.NOTE, channel, note, 0)) return
         c.performer.noteOff(channel, note)
         AudioEngine.noteOff(note)
@@ -256,11 +275,18 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     }
 
     override fun onControlChange(channel: Int, controller: Int, value: Int) {
+        c.pulseMidi()
         c.onMidi(MidiMap.CC, channel, controller, value)
     }
 
     override fun onProgramChange(channel: Int, program: Int) {
+        c.pulseMidi()
         c.onMidi(MidiMap.PC, channel, program, 0)
+    }
+
+    override fun onDevicesChanged() {
+        c.midiDevices = midi?.deviceNames() ?: emptyList()
+        c.notifyChanged()
     }
 
     override fun onStatus(message: String) {
@@ -317,7 +343,11 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             language = { ui.post { recreate() } },
             theme = { ui.post { recreate() } },
             cacheUsedMb = { c.cache.usedBytes() / 1_048_576 },
-            clearCache = { c.cache.clear() }
+            clearCache = { c.cache.clear() },
+            ir = c,
+            pickIr = { pickIrFile() },
+            irRebuild = { c.rebuildIr() },
+            console = { c.notifyChanged() }
         )
         val row1 = buttonRow(
             tr("Organ folder", "Organ folder") to { pickFolder() },
@@ -349,6 +379,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             addView(manualSpinner, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
         transposeField = NumberField(this, "Transpose", -12, 12, "st", settings.transpose) { v -> c.setTranspose(v) }
+        pitchField = NumberField(this, "Pitch (A4)", 415, 466, "Hz", settings.tuningA4) { v -> c.setPitch(v) }
         volumeField = NumberField(this, "Master volume", 0, 100, "%", settings.masterVolume, 5) { v -> c.setVolume(v) }
         memView = TextView(this).apply { textSize = 11f }
         val quick = LinearLayout(this).apply {
@@ -358,6 +389,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
             addView(organInfo)
             addView(manualRow)
             addView(transposeField)
+            addView(pitchField)
             addView(volumeField)
             addView(memView)
         }
@@ -414,6 +446,7 @@ class MainActivity : Activity(), MidiInputManager.Listener {
     companion object {
         private const val TAG = "OrganMIDI"
         private const val REQ_FOLDER = 1001
+        private const val REQ_IR = 1002
         private const val KEY_TREE = "tree_uri"
         private const val KEY_ORGAN = "organ_id"
     }

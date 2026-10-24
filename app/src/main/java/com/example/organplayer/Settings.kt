@@ -42,6 +42,16 @@ class Settings(context: Context) {
     @Volatile var reverbPre: Int = p.getInt("revpre", 20)              // ms pre-delay
         set(v) { field = v; p.edit().putInt("revpre", v).apply() }
 
+    // Impulse response (the IR file itself, its on/off and level are saved per organ)
+    @Volatile var irMaxMs: Int = p.getInt("irmax", 3000)               // longest IR used (longer = more CPU)
+        set(v) { field = v; p.edit().putInt("irmax", v).apply() }
+
+    // Console colours
+    @Volatile var autoReedColor: Boolean = p.getBoolean("reedcolor", true)
+        set(v) { field = v; p.edit().putBoolean("reedcolor", v).apply() }
+    @Volatile var reedWords: String = p.getString("reedwords", DEFAULT_REED_WORDS) ?: DEFAULT_REED_WORDS
+        set(v) { field = v; p.edit().putString("reedwords", v).apply() }
+
     // Loading speed
     @Volatile var sampleCache: Boolean = p.getBoolean("scache", false)
         set(v) { field = v; p.edit().putBoolean("scache", v).apply() }
@@ -63,6 +73,14 @@ class Settings(context: Context) {
         tuningA4 = 440; velocitySens = 0; maxVoices = 256; memCapMb = 700
         tremSpeed = 100; tremDepth = 100
         reverbOn = false; reverbLevel = 25; reverbRoom = 60; reverbDamp = 50; reverbPre = 20
+        irMaxMs = 3000; autoReedColor = true; reedWords = DEFAULT_REED_WORDS
+    }
+
+    companion object {
+        /** Stops whose name contains one of these words are shown in red in the console (editable in Settings). */
+        const val DEFAULT_REED_WORDS = "trompet, trumpet, tromba, posaun, trombone, bombard, tuba, hautbois, oboe, hautboy, " +
+            "clairon, clarion, clarin, cromorne, krummhorn, schalmei, shawm, regal, rankett, fagott, fagot, bassoon, " +
+            "basson, dulzian, englischhorn, english horn, cor anglais, cornopean, vox humana, voix humaine, clarinet, chamade"
     }
 
     fun applyToEngine() {

@@ -184,6 +184,130 @@ static std::shared_ptr<Sample> parseWav(const std::vector<uint8_t>& b, std::stri
 }
 
 // ---------------------------------------------------------------------------
+// Impulse response (convolution reverb): float WAV reader, FFT, partitioned convolver
+// ---------------------------------------------------------------------------
+static constexpr int kIrB = 512;      // block size of the convolver (wet path is delayed by one block; dry is not)
+
+// Reads any PCM16/24/32 or float32 WAV, mixes channels down to mono float. No int16 rounding (IR tails are quiet).
+static bool parseWavFloat(const std::vector<uint8_t>& b, std::vector<float>& out, int& rate, std::string& err) {
+    if (b.size() < 44 || memcmp(b.data(), "RIFF", 4) != 0 || memcmp(b.data() + 8, "WAVE", 4) != 0) {
+        err = "IR file is not a RIFF/WAVE file";
+        return false;
+    }
+    uint16_t fmtTag = 0, channels = 0, bits = 0;
+    uint32_t sr = 0;
+    const uint8_t* pcm = nullptr;
+    size_t pcmBytes = 0;
+    size_t p = 12;
+    while (p + 8 <= b.size()) {
+        const uint8_t* c = b.data() + p;
+        uint32_t sz = rd32(c + 4);
+        size_t body = p + 8;
+        size_t avail = b.size() - body;
+        size_t len = sz > avail ? avail : sz;
+        if (memcmp(c, "fmt ", 4) == 0 && len >= 16) {
+            fmtTag = rd16(c + 8);
+            channels = rd16(c + 10);
+            sr = rd32(c + 12);
+            bits = rd16(c + 22);
+            if (fmtTag == 0xFFFE && len >= 26) fmtTag = rd16(c + 8 + 24);
+        } else if (memcmp(c, "data", 4) == 0) {
+            pcm = c + 8;
+            pcmBytes = len;
+        }
+        p = body + len + (sz & 1);
+    }
+    if (!pcm || channels < 1 || sr == 0) { err = "IR WAV is corrupt (missing fmt/data)"; return false; }
+    const bool isPcm = fmtTag == 1 && (bits == 16 || bits == 24 || bits == 32);
+    const bool isFloat = fmtTag == 3 && bits == 32;
+    if (!isPcm && !isFloat) { err = "IR WAV format not supported (use 16/24/32-bit PCM or float)"; return false; }
+    const size_t bytesPer = bits / 8;
+    const size_t frameBytes = bytesPer * channels;
+    const size_t frames = pcmBytes / frameBytes;
+    if (frames < 64) { err = "IR WAV is too short"; return false; }
+    out.resize(frames);
+    for (size_t f = 0; f < frames; ++f) {
+        float sum = 0.0f;
+        for (uint16_t ch = 0; ch < channels; ++ch) {
+            const uint8_t* q = pcm + f * frameBytes + ch * bytesPer;
+            float v;
+            if (isFloat) { memcpy(&v, q, 4); }
+            else if (bits == 16) { v = (float) (int16_t) rd16(q) * (1.0f / 32768.0f); }
+            else if (bits == 24) {
+                const int32_t x = (int32_t) (((uint32_t) q[0] << 8) | ((uint32_t) q[1] << 16) | ((uint32_t) q[2] << 24)) >> 8;
+                v = (float) x * (1.0f / 8388608.0f);
+            } else { v = (float) ((int32_t) rd32(q)) * (1.0f / 2147483648.0f); }
+            sum += v;
+        }
+        out[f] = sum / (float) channels;
+    }
+    rate = (int) sr;
+    return true;
+}
+
+struct Fft {
+    int n = 0, logn = 0;
+    std::vector<float> cs, sn;
+    std::vector<int> rev;
+    void init(int N) {
+        n = N; logn = 0;
+        while ((1 << logn) < N) ++logn;
+        cs.resize(N / 2); sn.resize(N / 2);
+        for (int i = 0; i < N / 2; ++i) {
+            const double a = -2.0 * M_PI * i / N;
+            cs[i] = (float) std::cos(a);
+            sn[i] = (float) std::sin(a);
+        }
+        rev.resize(N);
+        for (int i = 0; i < N; ++i) {
+            int r = 0;
+            for (int b = 0; b < logn; ++b) if (i & (1 << b)) r |= 1 << (logn - 1 - b);
+            rev[i] = r;
+        }
+    }
+    // In place. inverse = conjugate twiddles, NO scaling. Thread-safe (tables are read-only).
+    void run(float* re, float* im, bool inverse) const {
+        for (int i = 0; i < n; ++i) {
+            const int j = rev[i];
+            if (j > i) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+        }
+        for (int len = 2; len <= n; len <<= 1) {
+            const int half = len >> 1, step = n / len;
+            for (int i = 0; i < n; i += len) {
+                for (int k = 0; k < half; ++k) {
+                    const float wr = cs[k * step];
+                    const float wi = inverse ? -sn[k * step] : sn[k * step];
+                    const int a = i + k, c = a + half;
+                    const float tr = re[c] * wr - im[c] * wi;
+                    const float ti = re[c] * wi + im[c] * wr;
+                    re[c] = re[a] - tr; im[c] = im[a] - ti;
+                    re[a] += tr;        im[a] += ti;
+                }
+            }
+        }
+    }
+};
+
+// Uniform-partitioned overlap-save convolver. Built on a loader thread, run on the audio thread.
+struct IrData {
+    int P = 0;                                   // number of partitions
+    std::vector<float> Hre, Him, Xre, Xim;       // P * (B+1): IR spectrum and the frequency-domain delay line
+    std::vector<float> inBuf, outBuf, prev, re, im, accRe, accIm;
+    int pos = 0, fdlPos = 0;
+    int workP = 0, workIdx = 0;   // spread-out accumulation: next partition / its delay-line slot
+    bool haveAcc = false;         // an accumulation is waiting to be turned into output
+    float seconds = 0.0f;
+    void clearState() {
+        std::fill(Xre.begin(), Xre.end(), 0.0f);
+        std::fill(Xim.begin(), Xim.end(), 0.0f);
+        std::fill(inBuf.begin(), inBuf.end(), 0.0f);
+        std::fill(outBuf.begin(), outBuf.end(), 0.0f);
+        std::fill(prev.begin(), prev.end(), 0.0f);
+        pos = 0; fdlPos = 0; workP = 0; workIdx = 0; haveAcc = false;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 // Light mono reverb (Freeverb-style: 8 comb + 4 allpass) with optional pre-delay
@@ -217,6 +341,7 @@ public:
     OrganEngine() {
         for (auto& g : mGroupGain) g.store(1.0f);
         mGroupCur.fill(1.0f);
+        mFft.init(2 * kIrB);
     }
 
     bool start() {
@@ -240,9 +365,11 @@ public:
         mSampleRate = static_cast<float>(mStream->getSampleRate());
         mAttack  = 1.0f - std::exp(-1.0f / (mSampleRate * 0.010f));
         mRelease = 1.0f - std::exp(-1.0f / (mSampleRate * 0.080f));
+        mRateKnown.store(true);
         mVoices.reserve(kMaxVoices);
         if (mTremBuf.empty()) mTremBuf.assign((size_t) kMaxTrem * 2 * kMaxFrames, 1.0f);
         initReverb();
+        rebuildIr();      // the impulse response (if one is loaded) is resampled to this stream's rate
 
         mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * mBursts.load());
 
@@ -383,6 +510,110 @@ public:
         mRevOn.store(on);
     }
 
+    // ---- impulse response (convolution reverb) ----
+    // 0 = ok, 1 = cannot read, 2 = bad WAV
+    int loadIr(int fd, int maxMs) {
+        std::vector<uint8_t> buf;
+        const bool ok = readAll(fd, buf);
+        close(fd);
+        if (!ok) { setError("Cannot read the IR file (read error or empty)"); return 1; }
+        std::vector<float> raw;
+        int rate = 0;
+        std::string err;
+        if (!parseWavFloat(buf, raw, rate, err)) { setError(err); return 2; }
+        buf.clear(); buf.shrink_to_fit();
+        {
+            std::lock_guard<std::mutex> l(mIrRawLock);
+            mIrRaw = std::move(raw);
+            mIrRate = rate;
+        }
+        return rebuildIr(maxMs);
+    }
+
+    void clearIr() {
+        { std::lock_guard<std::mutex> l(mIrRawLock); mIrRaw.clear(); mIrRaw.shrink_to_fit(); mIrRate = 0; }
+        { std::lock_guard<std::mutex> l(mErrLock); mIrInfoStr.clear(); }
+        publishIr(nullptr);
+    }
+
+    void setIr(bool on, float level) {
+        mIrLevel.store(std::min(2.0f, std::max(0.0f, level)));
+        mIrOn.store(on);
+    }
+
+    std::string irInfo() { std::lock_guard<std::mutex> l(mErrLock); return mIrInfoStr; }
+
+    // Re-creates the convolver from the stored IR (new length cap or new stream rate). Runs on the caller's thread.
+    int rebuildIr(int maxMs = -1) {
+        if (maxMs > 0) mIrMaxMs.store(std::max(200, std::min(10000, maxMs)));
+        std::lock_guard<std::mutex> bl(mIrBuildLock);
+        std::vector<float> x;
+        int rate;
+        { std::lock_guard<std::mutex> l(mIrRawLock); x = mIrRaw; rate = mIrRate; }
+        if (x.size() < 64 || rate <= 0) return 0;
+        if (!mRateKnown.load()) return 0;                // will be built when the stream starts
+        const double sr = (double) mSampleRate;
+        const int origRate = rate;
+        const double origSec = (double) x.size() / (double) rate;
+
+        if (rate != (int) std::lround(sr)) {              // linear resample to the stream rate
+            const double ratio = (double) rate / sr;
+            const size_t n = (size_t) ((double) x.size() / ratio);
+            std::vector<float> y(n);
+            for (size_t i = 0; i < n; ++i) {
+                const double src = (double) i * ratio;
+                const size_t i0 = (size_t) src;
+                const size_t i1 = std::min(i0 + 1, x.size() - 1);
+                const float fr = (float) (src - (double) i0);
+                y[i] = x[i0] * (1.0f - fr) + x[i1] * fr;
+            }
+            x.swap(y);
+        }
+        const size_t maxLen = (size_t) ((double) mIrMaxMs.load() * 0.001 * sr);
+        const bool truncated = x.size() > maxLen;
+        if (truncated) x.resize(std::max<size_t>(maxLen, (size_t) kIrB));
+        // soft fade at the end so a cut tail does not click
+        size_t fade = std::min(x.size() / 4, (size_t) ((truncated ? 0.030 : 0.005) * sr));
+        for (size_t i = 0; i < fade; ++i) {
+            const float g = 0.5f + 0.5f * std::cos(3.14159265f * (float) i / (float) fade);
+            x[x.size() - fade + i] *= g;
+        }
+        double e = 0.0;
+        for (float v : x) e += (double) v * (double) v;
+        if (e <= 1e-12) { setError("The IR file is silent"); publishIr(nullptr); return 2; }
+        const float sc = (float) (1.0 / std::sqrt(e));    // equal-energy normalisation
+        for (float& v : x) v *= sc;
+
+        auto d = std::make_shared<IrData>();
+        const int B = kIrB, N = 2 * kIrB, K = kIrB + 1;
+        d->P = (int) ((x.size() + (size_t) B - 1) / (size_t) B);
+        d->seconds = (float) ((double) x.size() / sr);
+        const size_t bins = (size_t) d->P * (size_t) K;
+        d->Hre.assign(bins, 0.0f); d->Him.assign(bins, 0.0f);
+        d->Xre.assign(bins, 0.0f); d->Xim.assign(bins, 0.0f);
+        d->inBuf.assign(B, 0.0f); d->outBuf.assign(B, 0.0f); d->prev.assign(B, 0.0f);
+        d->re.assign(N, 0.0f); d->im.assign(N, 0.0f);
+        d->accRe.assign(K, 0.0f); d->accIm.assign(K, 0.0f);
+        std::vector<float> re(N), im(N);
+        const float inv = 1.0f / (float) N;               // the inverse FFT scaling is folded into the IR
+        for (int p = 0; p < d->P; ++p) {
+            std::fill(re.begin(), re.end(), 0.0f);
+            std::fill(im.begin(), im.end(), 0.0f);
+            const size_t off = (size_t) p * (size_t) B;
+            for (int i = 0; i < B && off + (size_t) i < x.size(); ++i) re[i] = x[off + (size_t) i];
+            mFft.run(re.data(), im.data(), false);
+            float* hr = &d->Hre[(size_t) p * K];
+            float* hi = &d->Him[(size_t) p * K];
+            for (int k = 0; k < K; ++k) { hr[k] = re[k] * inv; hi[k] = im[k] * inv; }
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg), "IR: %.1f s file at %d Hz -> %.1f s used (%d partitions)%s",
+                 origSec, origRate, (double) d->seconds, d->P, truncated ? ", cut to the max length" : "");
+        { std::lock_guard<std::mutex> l(mErrLock); mIrInfoStr = msg; }
+        publishIr(std::move(d));
+        return 0;
+    }
+
     // ---- tremulants (slot 0..31) ----
     void setTremulant(int slot, bool on, float periodMs, float depthPct, float startMs, float stopMs) {
         if (slot < 0 || slot >= kMaxTrem) return;
@@ -407,7 +638,7 @@ public:
         prepareTremulants(numFrames);
         prepareGroups(numFrames);
         renderSamples(out, numFrames);
-        processReverb(out, numFrames);
+        if (!processIr(out, numFrames)) processReverb(out, numFrames);
 
         for (int i = 0; i < numFrames; ++i) out[i] = std::tanh(out[i]);   // soft limiter
         return oboe::DataCallbackResult::Continue;
@@ -556,6 +787,113 @@ private:
             mGroupStep[g] = (end - cur) / static_cast<float>(numFrames);
             mGroupCur[g] = end;
         }
+    }
+
+    void publishIr(std::shared_ptr<IrData> d) {
+        std::shared_ptr<IrData> old;
+        {
+            std::lock_guard<std::mutex> l(mIrLock);
+            old = std::move(mIrPending);
+            mIrPending = std::move(d);
+            mIrDirty = true;
+        }
+        // 'old' (the previous convolver) is freed here, on the loader thread, never on the audio thread
+    }
+
+    void quietReverb() {
+        if (!mRevIdle) { clearReverb(); mRevIdle = true; }
+        mRevMixCur = 0.0f;
+    }
+
+    // Partitioned convolution, spread over time so the audio callback never gets a CPU spike (low latency
+    // needs small buffers, and a spike would cause crackles). The wet path is delayed by two blocks; the dry
+    // sound you play is never delayed.
+    //   boundary (every B samples): finish the previous accumulation -> IFFT -> output block,
+    //                               then FFT the new input block and start accumulating it.
+    //   slice (every few samples):  a small share of the partition multiply-adds.
+    void irSlice(IrData& d, int count) {
+        const int K = kIrB + 1;
+        float* __restrict ar = d.accRe.data();
+        float* __restrict ai = d.accIm.data();
+        int p = d.workP, idx = d.workIdx;
+        const int end = std::min(d.P, p + count);
+        for (; p < end; ++p) {
+            const float* __restrict hr = &d.Hre[(size_t) p * K];
+            const float* __restrict hi = &d.Him[(size_t) p * K];
+            const float* __restrict xr = &d.Xre[(size_t) idx * K];
+            const float* __restrict xi = &d.Xim[(size_t) idx * K];
+            for (int k = 0; k < K; ++k) {
+                ar[k] += hr[k] * xr[k] - hi[k] * xi[k];
+                ai[k] += hr[k] * xi[k] + hi[k] * xr[k];
+            }
+            if (--idx < 0) idx = d.P - 1;
+        }
+        d.workP = p; d.workIdx = idx;
+    }
+
+    void irBoundary(IrData& d) {
+        const int B = kIrB, N = 2 * kIrB, K = kIrB + 1;
+        float* __restrict re = d.re.data();
+        float* __restrict im = d.im.data();
+        const float* ar = d.accRe.data();
+        const float* ai = d.accIm.data();
+        if (d.haveAcc) {
+            irSlice(d, d.P);                                   // normally already done; guarantees correctness
+            for (int k = 0; k < K; ++k) { re[k] = ar[k]; im[k] = ai[k]; }
+            for (int k = 1; k < B; ++k) { re[N - k] = ar[k]; im[N - k] = -ai[k]; }   // Hermitian symmetry
+            mFft.run(re, im, true);
+            std::memcpy(d.outBuf.data(), re + B, (size_t) B * sizeof(float));
+        }
+        std::memcpy(re, d.prev.data(), (size_t) B * sizeof(float));
+        std::memcpy(re + B, d.inBuf.data(), (size_t) B * sizeof(float));
+        std::memcpy(d.prev.data(), d.inBuf.data(), (size_t) B * sizeof(float));
+        std::fill(im, im + N, 0.0f);
+        mFft.run(re, im, false);
+        std::memcpy(&d.Xre[(size_t) d.fdlPos * K], re, (size_t) K * sizeof(float));
+        std::memcpy(&d.Xim[(size_t) d.fdlPos * K], im, (size_t) K * sizeof(float));
+        std::fill(d.accRe.begin(), d.accRe.end(), 0.0f);
+        std::fill(d.accIm.begin(), d.accIm.end(), 0.0f);
+        d.workP = 0; d.workIdx = d.fdlPos; d.haveAcc = true;
+        if (++d.fdlPos >= d.P) d.fdlPos = 0;
+    }
+
+    // true = the impulse response is handling the reverb (the built-in reverb is bypassed)
+    bool processIr(float* out, int numFrames) {
+        if (mIrLock.try_lock()) {
+            if (mIrDirty) {
+                mIrActive.swap(mIrPending);
+                mIrDirty = false;
+                mIrIdle = true;
+                mIrMixCur = 0.0f;
+            }
+            mIrLock.unlock();
+        }
+        IrData* d = mIrActive.get();
+        if (!d) return false;
+        const float target = mIrOn.load(std::memory_order_relaxed) ? mIrLevel.load(std::memory_order_relaxed) : 0.0f;
+        if (target <= 0.0f && mIrMixCur <= 0.0001f) {
+            mIrMixCur = 0.0f;
+            if (!mIrIdle) { d->clearState(); mIrIdle = true; }
+            return false;
+        }
+        mIrIdle = false;
+        quietReverb();
+        const int B = kIrB;
+        constexpr int kSliceEvery = 32;                                   // samples between work slices
+        const int perSlice = std::max(1, (d->P * kSliceEvery + B - 1) / B);
+        const float step = (target - mIrMixCur) / (float) numFrames;
+        for (int i = 0; i < numFrames; ++i) {
+            const float dry = out[i];
+            d->inBuf[d->pos] = dry;
+            const float wet = d->outBuf[d->pos];
+            ++d->pos;
+            if (d->pos >= B) { irBoundary(*d); d->pos = 0; }
+            else if ((d->pos & (kSliceEvery - 1)) == 0 && d->haveAcc) irSlice(*d, perSlice);
+            mIrMixCur += step;
+            out[i] = dry + wet * mIrMixCur;
+        }
+        mIrMixCur = target;
+        return true;
     }
 
     void initReverb() {
@@ -717,6 +1055,22 @@ private:
     float mRevMixCur = 0.0f;
     bool mRevIdle = true;
 
+    // impulse response
+    Fft mFft;
+    std::atomic<bool> mRateKnown{false};
+    std::atomic<bool> mIrOn{false};
+    std::atomic<float> mIrLevel{0.4f};
+    std::atomic<int> mIrMaxMs{3000};
+    std::mutex mIrRawLock, mIrBuildLock, mIrLock;
+    std::vector<float> mIrRaw;                    // IR as read from the file (mono float)
+    int mIrRate = 0;
+    std::shared_ptr<IrData> mIrPending;           // handed to the audio thread through mIrLock / mIrDirty
+    bool mIrDirty = false;
+    std::shared_ptr<IrData> mIrActive;            // audio thread only
+    float mIrMixCur = 0.0f;                       // audio thread only
+    bool mIrIdle = true;                          // audio thread only
+    std::string mIrInfoStr;                       // guarded by mErrLock
+
     // wavetable test voice
     std::array<std::atomic<bool>, 128> mGate{};
     std::array<std::atomic<float>, 128> mVel{};
@@ -788,6 +1142,31 @@ Java_com_example_organplayer_AudioEngine_nativeSetReverb(JNIEnv*, jobject, jbool
                                                          jfloat room, jfloat damp, jfloat preMs) {
     if (!gEngine) gEngine = std::make_shared<OrganEngine>();
     gEngine->setReverb(on != JNI_FALSE, level, room, damp, preMs);
+}
+JNIEXPORT jint JNICALL
+Java_com_example_organplayer_AudioEngine_nativeLoadIr(JNIEnv*, jobject, jint fd, jint maxMs) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    return gEngine->loadIr(fd, maxMs);
+}
+JNIEXPORT jint JNICALL
+Java_com_example_organplayer_AudioEngine_nativeRebuildIr(JNIEnv*, jobject, jint maxMs) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    return gEngine->rebuildIr(maxMs);
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeClearIr(JNIEnv*, jobject) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->clearIr();
+}
+JNIEXPORT void JNICALL
+Java_com_example_organplayer_AudioEngine_nativeSetIr(JNIEnv*, jobject, jboolean on, jfloat level) {
+    if (!gEngine) gEngine = std::make_shared<OrganEngine>();
+    gEngine->setIr(on != JNI_FALSE, level);
+}
+JNIEXPORT jstring JNICALL
+Java_com_example_organplayer_AudioEngine_nativeIrInfo(JNIEnv* env, jobject) {
+    std::string e = gEngine ? gEngine->irInfo() : std::string();
+    return env->NewStringUTF(e.c_str());
 }
 JNIEXPORT void JNICALL
 Java_com_example_organplayer_AudioEngine_nativePanic(JNIEnv*, jobject) {

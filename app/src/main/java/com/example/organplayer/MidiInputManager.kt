@@ -24,9 +24,11 @@ class MidiInputManager(context: Context, private val listener: Listener) {
         fun onProgramChange(channel: Int, program: Int)
         // Tinatawag sa main thread.
         fun onStatus(message: String)
+        /** The list of connected keyboards changed (main thread). */
+        fun onDevicesChanged() {}
     }
 
-    private class OpenDevice(val device: MidiDevice, val port: MidiOutputPort, val receiver: MidiReceiver)
+    private class OpenDevice(val device: MidiDevice, val port: MidiOutputPort, val receiver: MidiReceiver, val name: String)
 
     private val midiManager = context.getSystemService(Context.MIDI_SERVICE) as MidiManager
     private val handler = Handler(Looper.getMainLooper())
@@ -37,6 +39,7 @@ class MidiInputManager(context: Context, private val listener: Listener) {
         override fun onDeviceAdded(info: MidiDeviceInfo) = openDevice(info)
         override fun onDeviceRemoved(info: MidiDeviceInfo) {
             closeDevice(info.id)
+            listener.onDevicesChanged()
             listener.onStatus(tr("Removed: ", "Natanggal: ") + "${nameOf(info)}")
         }
     }
@@ -51,7 +54,11 @@ class MidiInputManager(context: Context, private val listener: Listener) {
     fun stop() {
         midiManager.unregisterDeviceCallback(deviceCallback)
         open.keys.toList().forEach { closeDevice(it) }
+        listener.onDevicesChanged()
     }
+
+    /** Names of the keyboards that are connected right now. */
+    fun deviceNames(): List<String> = open.values.map { it.name }
 
     private fun nameOf(info: MidiDeviceInfo): String =
         info.properties.getString(MidiDeviceInfo.PROPERTY_NAME) ?: "MIDI device #${info.id}"
@@ -73,8 +80,9 @@ class MidiInputManager(context: Context, private val listener: Listener) {
                     } else {
                         val receiver = NoteReceiver()
                         port.connect(receiver)
-                        open[info.id] = OpenDevice(device, port, receiver)
+                        open[info.id] = OpenDevice(device, port, receiver, name)
                         listener.onStatus(tr("Connected: ", "Nakakonekta: ") + name)
+                        listener.onDevicesChanged()
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "openOutputPort failed", e)

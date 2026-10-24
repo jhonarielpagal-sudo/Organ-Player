@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -17,7 +19,11 @@ class SettingsHooks(
     val language: () -> Unit = {},
     val theme: () -> Unit = {},
     val cacheUsedMb: () -> Long = { 0L },
-    val clearCache: () -> Unit = {}
+    val clearCache: () -> Unit = {},
+    val ir: OrganController? = null,        // impulse response is saved per organ
+    val pickIr: () -> Unit = {},
+    val irRebuild: () -> Unit = {},
+    val console: () -> Unit = {}            // console colours changed
 )
 
 /** Settings: type the number (or use - / +). */
@@ -91,6 +97,58 @@ object SettingsDialog {
         field(tr("Damping (darker tail)", "Damping (mas madilim na tail)"), 0, 100, "%", s.reverbDamp, 5) { s.reverbDamp = it }
         field(tr("Pre-delay", "Pre-delay"), 0, 250, "ms", s.reverbPre, 5) { s.reverbPre = it }
 
+        // ---- Impulse response (convolution reverb) ----
+        var dlgRef: AlertDialog? = null
+        box.addView(UiKit.header(act, tr("Impulse response (this organ)", "Impulse response (para sa organ na ito)")))
+        val irc = hooks.ir
+        if (irc == null || irc.organ == null) {
+            box.addView(TextView(act).apply {
+                textSize = 12f
+                text = tr("Load an organ first. The impulse response is saved per organ file.", "Mag-load muna ng organ. Naka-save bawat organ file ang impulse response.")
+            })
+        } else {
+            val nameView = TextView(act).apply {
+                textSize = 13f
+                text = if (irc.ir.uri == null) tr("No IR file chosen.", "Wala pang napiling IR file.")
+                       else irc.ir.name + (if (irc.irStatus.isNotEmpty()) "\n" + irc.irStatus else "")
+            }
+            box.addView(nameView)
+            val btns = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
+            btns.addView(UiKit.button(act, tr("Choose IR (.wav)", "Pumili ng IR (.wav)")) { dlgRef?.dismiss(); hooks.pickIr() },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            btns.addView(UiKit.button(act, tr("Remove IR", "Alisin ang IR")) { irc.clearIrFile(); nameView.text = tr("No IR file chosen.", "Wala pang napiling IR file.") },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            box.addView(btns, lp())
+            toggle(tr("Impulse response on", "Impulse response naka-on"), irc.ir.on) { irc.setIrOn(it) }
+            field(tr("IR level (wet)", "IR level (wet)"), 0, 100, "%", irc.ir.level, 5) { irc.setIrLevel(it) }
+            field(tr("Longest IR used", "Pinakamahabang IR na gagamitin"), 500, 8000, "ms", s.irMaxMs, 100) { s.irMaxMs = it; hooks.irRebuild() }
+            box.addView(TextView(act).apply {
+                textSize = 11f
+                text = tr("While the IR is on, the built-in reverb above is bypassed. A longer IR uses more CPU; if you hear crackles, shorten it. The sound you play is never delayed by the IR.",
+                    "Habang naka-on ang IR, naka-bypass ang built-in reverb sa itaas. Mas mahabang IR = mas mabigat sa CPU; kung may crackle, paikliin. Hindi naaantala ng IR ang tinutugtog mo.")
+            })
+        }
+
+        // ---- Console colours ----
+        box.addView(UiKit.header(act, tr("Console colours", "Kulay sa Console")))
+        toggle(tr("Reed stops in red", "Pula ang mga reed stop"), s.autoReedColor) { s.autoReedColor = it; hooks.console() }
+        box.addView(TextView(act).apply { textSize = 12f; text = tr("Reed words (a stop whose name contains one of these is red):", "Mga salita ng reed (pula ang stop na may ganitong salita sa pangalan):") })
+        box.addView(EditText(act).apply {
+            setText(s.reedWords); textSize = 12f; minLines = 2
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(e: android.text.Editable?) { s.reedWords = e?.toString() ?: ""; hooks.console() }
+            })
+        })
+        box.addView(UiKit.button(act, tr("Reset reed words", "I-reset ang reed words")) {
+            s.reedWords = Settings.DEFAULT_REED_WORDS; hooks.console(); dlgRef?.dismiss(); show(act, s, hooks)
+        })
+        box.addView(TextView(act).apply {
+            textSize = 11f
+            text = tr("Long-press a stop in the Console to give it its own text colour.", "I-long-press ang stop sa Console para bigyan ng sariling kulay ng text.")
+        })
+
         box.addView(UiKit.header(act, "Tremulant"))
         field(tr("Tremulant speed", "Bilis ng tremulant"), 25, 200, "%", s.tremSpeed, 5) { s.tremSpeed = it; hooks.tremolo() }
         field(tr("Tremulant depth", "Lalim ng tremulant"), 0, 300, "%", s.tremDepth, 5) { s.tremDepth = it; hooks.tremolo() }
@@ -117,6 +175,7 @@ object SettingsDialog {
             .setPositiveButton("OK") { _, _ -> fields.forEach { it.commit() } }
             .setNeutralButton("Reset") { _, _ -> s.reset(); s.applyToEngine(); hooks.tremolo(); show(act, s, hooks) }
             .create()
+        dlgRef = dlg
         dlg.setOnDismissListener { fields.forEach { it.commit() } }
         var themeInit = true
         themeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {

@@ -10,7 +10,9 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.graphics.Typeface
 import android.widget.CheckBox
+import android.widget.HorizontalScrollView
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -215,6 +217,12 @@ object SwellDialog {
     }
 }
 
+/** Colours offered for the text of a stop in the Console (made for a dark background). */
+private val STOP_COLORS = intArrayOf(
+    0xFFFF5A5F.toInt(), 0xFFFF9A3C.toInt(), 0xFFFFE066.toInt(), 0xFF5CDB95.toInt(),
+    0xFF4DD0E1.toInt(), 0xFF6CA6FF.toInt(), 0xFFC77DFF.toInt(), 0xFFFF8AD8.toInt()
+)
+
 /** Per-stop adjustments for a loaded stop: volume, own release time, tuning, and single-key tuning. */
 object StopSettingsDialog {
     fun show(act: Activity, c: OrganController, s: Stop) {
@@ -230,6 +238,34 @@ object StopSettingsDialog {
         addField(NumberField(act, "Release", 0, 5000, "ms", s.releaseMs, 10) { s.releaseMs = it; c.saveStopConfigs() })
         box.addView(hint(act, tr("Release 0 = use the global release from Settings.", "Release 0 = gamitin ang global release sa Settings.")))
         addField(NumberField(act, tr("Tuning (whole stop)", "Tuning (buong stop)"), -100, 100, "cents", s.tuneCents) { s.tuneCents = it; c.saveStopConfigs() })
+
+        // Text colour of this stop in the Console
+        box.addView(UiKit.header(act, tr("Text colour in the Console", "Kulay ng text sa Console")))
+        box.addView(hint(act, tr(
+            "Auto = reeds are red (Settings > Console colours), the rest normal. Plain = always normal.",
+            "Auto = pula ang mga reed (Settings > Console colours), normal ang iba. Plain = laging normal.")))
+        val swatchRow = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
+        val swatchViews = ArrayList<Pair<TextView, Int>>()
+        fun refreshSwatches() {
+            for ((v, value) in swatchViews) {
+                val sel = s.textColor == value
+                v.background = UiKit.shape(act, 0xFF23262D.toInt(), if (sel) UiKit.AMBER else 0xFF3A3F4A.toInt(), 6, if (sel) 3 else 1)
+            }
+        }
+        fun addSwatch(label: String, shown: Int, value: Int) {
+            val v = TextView(act).apply {
+                text = label; gravity = android.view.Gravity.CENTER; textSize = 13f
+                setTypeface(typeface, Typeface.BOLD); setTextColor(shown)
+                setOnClickListener { s.textColor = value; c.saveStopConfigs(); c.notifyChanged(); refreshSwatches() }
+            }
+            swatchViews += v to value
+            swatchRow.addView(v, LinearLayout.LayoutParams(UiKit.dp(act, 52), UiKit.dp(act, 40)).apply { setMargins(UiKit.dp(act, 3), UiKit.dp(act, 3), UiKit.dp(act, 3), UiKit.dp(act, 3)) })
+        }
+        addSwatch("Auto", if (c.isReed(s.name) && c.settings.autoReedColor) OrganController.REED_RED else 0xFFC9CED6.toInt(), Stop.COLOR_AUTO)
+        addSwatch("Plain", 0xFFC9CED6.toInt(), Stop.COLOR_PLAIN)
+        for (col in STOP_COLORS) addSwatch("Aa", col, col)
+        refreshSwatches()
+        box.addView(HorizontalScrollView(act).apply { addView(swatchRow) })
 
         box.addView(UiKit.header(act, tr("Tune a single key", "I-tune ang isang key")))
         box.addView(hint(act, tr(
@@ -275,8 +311,8 @@ object StopSettingsDialog {
             .setView(ScrollView(act).apply { addView(box) })
             .setPositiveButton(tr("Close", "Isara")) { _, _ -> fields.forEach { it.commit() } }
             .setNeutralButton("Reset") { _, _ ->
-                s.gainPct = 100; s.releaseMs = 0; s.tuneCents = 0; s.pipeCents.clear()
-                c.saveStopConfigs(); show(act, c, s)
+                s.gainPct = 100; s.releaseMs = 0; s.tuneCents = 0; s.pipeCents.clear(); s.textColor = Stop.COLOR_AUTO
+                c.saveStopConfigs(); c.notifyChanged(); show(act, c, s)
             }
             .create()
         dlg.setOnDismissListener { fields.forEach { it.commit() }; c.saveStopConfigs() }
