@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +18,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
+
+#define ORGAN_ENGINE_V063 1
 #define LOG_TAG "OrganEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -310,6 +317,21 @@ struct IrData {
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
+// Denormal numbers (tiny values near zero, e.g. decaying reverb tails) make the CPU many times slower.
+// Flush them to zero on the audio thread.
+static inline void flushDenormals() {
+#if defined(__aarch64__)
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    if (!(fpcr & (1ull << 24))) {
+        fpcr |= (1ull << 24);
+        asm volatile("msr fpcr, %0" : : "r"(fpcr));
+    }
+#elif defined(__SSE__)
+    _mm_setcsr(_mm_getcsr() | 0x8040);
+#endif
+}
+
 // Light mono reverb (Freeverb-style: 8 comb + 4 allpass) with optional pre-delay
 struct Comb {
     std::vector<float> buf; size_t idx = 0; float store = 0.0f;
@@ -342,6 +364,15 @@ public:
         for (auto& g : mGroupGain) g.store(1.0f);
         mGroupCur.fill(1.0f);
         mFft.init(2 * kIrB);
+        mVictims.reserve(kMaxVoices);
+    }
+
+    // Buffers the audio thread needs (allocated before the stream starts, never on the audio thread)
+    void allocBuffers() {
+        mVoices.reserve(kMaxVoices);
+        mVictims.reserve(kMaxVoices);
+        if (mTremBuf.empty()) mTremBuf.assign((size_t) kMaxTrem * 2 * kMaxFrames, 1.0f);
+        if (mMaskBuf.empty()) mMaskBuf.assign((size_t) (kMaxMasks + 1) * 2 * kMaxFrames, 1.0f);
     }
 
     bool start() {
@@ -366,8 +397,7 @@ public:
         mAttack  = 1.0f - std::exp(-1.0f / (mSampleRate * 0.010f));
         mRelease = 1.0f - std::exp(-1.0f / (mSampleRate * 0.080f));
         mRateKnown.store(true);
-        mVoices.reserve(kMaxVoices);
-        if (mTremBuf.empty()) mTremBuf.assign((size_t) kMaxTrem * 2 * kMaxFrames, 1.0f);
+        allocBuffers();
         initReverb();
         rebuildIr();      // the impulse response (if one is loaded) is resampled to this stream's rate
 
@@ -630,6 +660,8 @@ public:
     // ---- audio callback ----
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream*, void* audioData,
                                           int32_t numFrames) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        flushDenormals();
         auto* out = static_cast<float*>(audioData);
         std::fill(out, out + numFrames, 0.0f);
 
@@ -649,6 +681,12 @@ public:
         if (pk > mPeak.load(std::memory_order_relaxed)) mPeak.store(pk, std::memory_order_relaxed);
         const int nv = (int) mVoices.size();
         if (nv > mVoicePeak.load(std::memory_order_relaxed)) mVoicePeak.store(nv, std::memory_order_relaxed);
+
+        // DSP load = time spent in this callback / time the buffer lasts (100% = a glitch)
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const float load = (float) (dt * (double) mSampleRate / (double) std::max(1, (int) numFrames));
+        mLoadAvg.store(mLoadAvg.load(std::memory_order_relaxed) * 0.99f + load * 0.01f, std::memory_order_relaxed);
+        if (load > mLoadMax.load(std::memory_order_relaxed)) mLoadMax.store(load, std::memory_order_relaxed);
         return oboe::DataCallbackResult::Continue;
     }
 
@@ -665,13 +703,17 @@ private:
     static constexpr int kMaxTrem = 32;
     static constexpr int kMaxFrames = 4096;
     static constexpr int kMaxGroups = 16;
+    static constexpr int kMaxMasks = 12;      // distinct tremulant combinations cached per callback
 
     struct Cmd { int type; int key; float vel; uint32_t mask; std::shared_ptr<const Sample> s;
                  int tag; int group; float gain; float cents; float relMs; };
     struct Voice {
-        std::shared_ptr<const Sample> s;
-        double pos = 0.0;
-        double ratio = 1.0;
+        std::shared_ptr<const Sample> s;   // keeps the sample alive
+        const int16_t* d = nullptr;        // cached sample data (audio thread reads these, not the shared_ptr)
+        int size = 0, loopStart = 0, loopEnd = 0;
+        bool loop = false;
+        uint64_t pos = 0;                  // read position, 32.32 fixed point
+        uint64_t inc = 0;                  // step per output sample, 32.32 fixed point
         float gain = 0.5f;
         float env = 0.0f;
         bool releasing = false;
@@ -684,19 +726,22 @@ private:
 
     std::string infoLocked() {
         if (!mStream) return "Audio stopped";
-        char buf[420];
+        char buf[640];
         const auto xr = mStream->getXRunCount();
         const int xruns = xr ? xr.value() : -1;
         const float peak = mPeak.exchange(0.0f);          // since the last time this was read
         const int vpeak = mVoicePeak.exchange(0);
+        const float lpeak = mLoadMax.exchange(0.0f);
         int n = snprintf(buf, sizeof(buf), "Audio: %s, %d Hz, burst %d, buffer %d frames (~%.1f ms)"
-                 "\nxruns (glitches): %d | voices: peak %d of %zu max, dropped %d | peak level %.2f",
+                 "\nxruns (glitches): %d | voices: peak %d of %zu max, dropped %d, stolen %d | peak level %.2f"
+                 "\nDSP load: avg %.0f%%, peak %.0f%% (100%% = glitch)",
                  oboe::convertToText(mStream->getAudioApi()), mStream->getSampleRate(),
                  mStream->getFramesPerBurst(), mStream->getBufferSizeInFrames(),
                  mStream->getBufferSizeInFrames() * 1000.0 / mStream->getSampleRate(),
-                 xruns, vpeak, mMaxVoices.load(), mDropped.load(), (double) peak);
+                 xruns, vpeak, mMaxVoices.load(), mDropped.load(), mStolen.load(), (double) peak,
+                 (double) (mLoadAvg.load() * 100.0f), (double) (lpeak * 100.0f));
         if (peak > 1.0f && n > 0 && n < (int) sizeof(buf))
-            snprintf(buf + n, sizeof(buf) - (size_t) n, " (over 1.0: the soft limiter is squashing the sound - lower Master volume)");
+            snprintf(buf + n, sizeof(buf) - (size_t) n, "\n(peak level over 1.0: the soft limiter is squashing the sound - lower Master volume)");
         return buf;
     }
 
@@ -707,6 +752,37 @@ private:
         if (mPending.size() < kMaxPending) mPending.push_back(std::move(c));
     }
 
+    Voice makeVoice(Cmd& c, float sens, double gc) {
+        Voice v;
+        v.s = std::move(c.s);
+        const Sample& sm = *v.s;
+        v.d = sm.data.data();
+        v.size = (int) sm.data.size();
+        v.loop = sm.hasLoop();
+        v.loopStart = v.loop ? sm.loopStart : 0;
+        v.loopEnd = v.loop ? sm.loopEnd : 0;
+        const double ratio = (static_cast<double>(sm.sampleRate) / static_cast<double>(mSampleRate))
+                             * std::exp2((static_cast<double>(sm.pitchCents) + gc + c.cents) / 1200.0);
+        v.inc = (uint64_t) (std::max(0.0001, std::min(60.0, ratio)) * 4294967296.0);
+        v.gain = (1.0f - sens * (1.0f - c.vel)) * sm.gain * c.gain;
+        v.key = c.key;
+        v.tremMask = c.mask;
+        v.tag = c.tag;
+        v.group = std::min(kMaxGroups - 1, std::max(0, c.group));
+        v.relStep = c.relMs > 0.0f ? 1.0f / (c.relMs * 0.001f * mSampleRate) : 0.0f;
+        return v;
+    }
+
+    // Voice cap reached: instead of leaving the new note silent, take over the quietest voice that is
+    // already fading out (released). Built once per callback, only when the cap is hit.
+    void buildVictims() {
+        mVictims.clear();
+        for (size_t i = 0; i < mVoices.size(); ++i)
+            if (mVoices[i].releasing) mVictims.push_back((int) i);
+        std::sort(mVictims.begin(), mVictims.end(),
+                  [this](int a, int b) { return mVoices[(size_t) a].env < mVoices[(size_t) b].env; });
+    }
+
     void processCommands() {
         if (!mCmdLock.try_lock()) return;      // huwag mag-block sa audio thread
         mLocal.swap(mPending);
@@ -714,22 +790,21 @@ private:
         const float sens = mVelSens.load(std::memory_order_relaxed);
         const double gc = mGlobalCents.load(std::memory_order_relaxed);
         const size_t maxV = mMaxVoices.load(std::memory_order_relaxed);
+        bool victimsReady = false;
+        size_t victimPos = 0;
         for (auto& c : mLocal) {
             if (c.type == 0) {
-                if (mVoices.size() < maxV && c.s) {
-                    Voice v;
-                    v.s = std::move(c.s);
-                    v.ratio = (static_cast<double>(v.s->sampleRate) / static_cast<double>(mSampleRate))
-                              * std::exp2((static_cast<double>(v.s->pitchCents) + gc + c.cents) / 1200.0);
-                    v.gain = (1.0f - sens * (1.0f - c.vel)) * v.s->gain * c.gain;
-                    v.key = c.key;
-                    v.tremMask = c.mask;
-                    v.tag = c.tag;
-                    v.group = std::min(kMaxGroups - 1, std::max(0, c.group));
-                    v.relStep = c.relMs > 0.0f ? 1.0f / (c.relMs * 0.001f * mSampleRate) : 0.0f;
-                    mVoices.push_back(std::move(v));
-                } else if (c.s) {
-                    mDropped.fetch_add(1, std::memory_order_relaxed);   // voice cap reached: this pipe stays silent
+                if (!c.s) continue;
+                if (mVoices.size() < maxV) {
+                    mVoices.push_back(makeVoice(c, sens, gc));
+                } else {
+                    if (!victimsReady) { buildVictims(); victimsReady = true; victimPos = 0; }
+                    if (victimPos < mVictims.size()) {
+                        mVoices[(size_t) mVictims[victimPos++]] = makeVoice(c, sens, gc);
+                        mStolen.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        mDropped.fetch_add(1, std::memory_order_relaxed);   // nothing left to take over: this pipe stays silent
+                    }
                 }
             } else if (c.type == 1) {
                 for (auto& v : mVoices) if (v.key == c.key && v.tag == c.tag) v.releasing = true;
@@ -961,49 +1036,114 @@ private:
         mRevMixCur = target;
     }
 
+    // Combined tremulant curves for one combination of tremulants (amplitude, and pitch change as a delta).
+    // Computed once per callback and shared by every voice with the same combination.
+    void getMaskBuffers(uint32_t tm, int numFrames, const float*& amp, const float*& pd) {
+        int slot = -1;
+        for (int k = 0; k < mMaskCount; ++k) if (mMaskKey[k] == tm) { slot = k; break; }
+        bool fill = false;
+        if (slot < 0) {
+            if (mMaskCount < kMaxMasks) { slot = mMaskCount++; mMaskKey[slot] = tm; }
+            else slot = kMaxMasks;                 // cache full: use the scratch slot, recomputed each time
+            fill = true;
+        }
+        float* a = &mMaskBuf[(size_t) (slot * 2) * kMaxFrames];
+        float* p = &mMaskBuf[(size_t) (slot * 2 + 1) * kMaxFrames];
+        if (fill) {
+            for (int i = 0; i < numFrames; ++i) { a[i] = 1.0f; p[i] = 1.0f; }
+            uint32_t b = tm;
+            while (b) {
+                const int t = __builtin_ctz(b);
+                b &= b - 1;
+                const float* ta = &mTremBuf[(size_t) (t * 2) * kMaxFrames];
+                const float* tp = &mTremBuf[(size_t) (t * 2 + 1) * kMaxFrames];
+                for (int i = 0; i < numFrames; ++i) { a[i] *= ta[i]; p[i] *= tp[i]; }
+            }
+            for (int i = 0; i < numFrames; ++i) p[i] -= 1.0f;
+        }
+        amp = a; pd = p;
+    }
+
+    // One voice, one callback. Specialised at compile time so the inner loop has no unused branches:
+    //   LOOP = sample has a loop, TREM = tremulant on this voice, ENV = attack or release still running.
+    template <bool LOOP, bool TREM, bool ENV>
+    static bool renderKernel(Voice& v, float* __restrict out, int numFrames,
+                             const float* __restrict ampBuf, const float* __restrict pdBuf,
+                             float gTot, float attackStep, float relStep, float gm, const float gmStep) {
+        const int16_t* __restrict d = v.d;
+        uint64_t pos = v.pos;
+        const uint64_t inc = v.inc;
+        const float incF = (float) inc;
+        float env = v.env;
+        const bool rel = v.releasing;
+        const uint32_t endIdx = (uint32_t) (v.size - 1);
+        const uint32_t loopEnd = (uint32_t) v.loopEnd, loopStart = (uint32_t) v.loopStart;
+        const uint64_t loopEndFx = (uint64_t) loopEnd << 32;
+        const uint64_t loopLenFx = (uint64_t) (loopEnd - loopStart) << 32;
+        bool done = false;
+        for (int i = 0; i < numFrames; ++i) {
+            if (ENV) {
+                if (rel) {
+                    env -= relStep;
+                    if (env <= 0.0f) { done = true; break; }
+                } else if (env < 1.0f) {
+                    env = std::min(1.0f, env + attackStep);
+                }
+            }
+            const uint32_t idx = (uint32_t) (pos >> 32);
+            uint32_t n1 = idx + 1;
+            if (LOOP) {
+                if (n1 >= loopEnd) n1 = loopStart;
+            } else if (idx >= endIdx) {
+                done = true;
+                break;
+            }
+            const float fr = (float) (uint32_t) pos * (1.0f / 4294967296.0f);
+            const float a = (float) d[idx], b = (float) d[n1];
+            float x = (a + (b - a) * fr) * gTot * gm;
+            if (ENV) x *= env;
+            if (TREM) {
+                x *= ampBuf[i];
+                pos += inc + (uint64_t) (int64_t) (incF * pdBuf[i]);
+            } else {
+                pos += inc;
+            }
+            out[i] += x;
+            gm += gmStep;
+            if (LOOP) { while (pos >= loopEndFx) pos -= loopLenFx; }
+        }
+        v.pos = pos;
+        v.env = env;
+        return done;
+    }
+
+    template <bool LOOP, bool TREM>
+    static bool renderPick(bool env, Voice& v, float* out, int n, const float* amp, const float* pd,
+                           float gTot, float as, float rs, float gm, float gms) {
+        return env ? renderKernel<LOOP, TREM, true>(v, out, n, amp, pd, gTot, as, rs, gm, gms)
+                   : renderKernel<LOOP, TREM, false>(v, out, n, amp, pd, gTot, as, rs, gm, gms);
+    }
+
     void renderSamples(float* out, int numFrames) {
         const float attackStep = 1.0f / (mAttackMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
         const float releaseStep = 1.0f / (mReleaseMs.load(std::memory_order_relaxed) * 0.001f * mSampleRate);
         const float master = mMaster.load(std::memory_order_relaxed);
+        mMaskCount = 0;
         for (size_t vi = 0; vi < mVoices.size();) {
             Voice& v = mVoices[vi];
-            const Sample& s = *v.s;
-            const int16_t* d = s.data.data();
-            const int size = static_cast<int>(s.data.size());
-            const bool loop = s.hasLoop();
             const uint32_t tm = v.tremMask & mTremActive;
-            bool done = false;
-            for (int i = 0; i < numFrames; ++i) {
-                const int idx = static_cast<int>(v.pos);
-                if (idx >= size - 1) { done = true; break; }
-                const float fr = static_cast<float>(v.pos - idx);
-                int n1 = idx + 1;
-                if (loop && n1 >= s.loopEnd) n1 = s.loopStart;
-                const float smp = (d[idx] * (1.0f - fr) + d[n1] * fr) * (1.0f / 32768.0f);
-                if (v.releasing) {
-                    v.env -= (v.relStep > 0.0f ? v.relStep : releaseStep);
-                    if (v.env <= 0.0f) { done = true; break; }
-                } else if (v.env < 1.0f) {
-                    v.env = std::min(1.0f, v.env + attackStep);
-                }
-                float amp = 1.0f, pit = 1.0f;
-                if (tm) {
-                    uint32_t b = tm;
-                    while (b) {
-                        const int t = __builtin_ctz(b);
-                        b &= b - 1;
-                        amp *= mTremBuf[(size_t) (t * 2) * kMaxFrames + i];
-                        pit *= mTremBuf[(size_t) (t * 2 + 1) * kMaxFrames + i];
-                    }
-                }
-                const float gm = mGroupStart[v.group] + mGroupStep[v.group] * static_cast<float>(i);
-                out[i] += smp * v.env * v.gain * master * amp * gm;
-                v.pos += v.ratio * pit;
-                if (loop) {
-                    const double len = static_cast<double>(s.loopEnd - s.loopStart);
-                    while (v.pos >= s.loopEnd) v.pos -= len;
-                }
-            }
+            const float* amp = nullptr;
+            const float* pd = nullptr;
+            if (tm) getMaskBuffers(tm, numFrames, amp, pd);
+            const float gTot = v.gain * master * (1.0f / 32768.0f);
+            const float gm = mGroupStart[v.group], gms = mGroupStep[v.group];
+            const float rs = v.relStep > 0.0f ? v.relStep : releaseStep;
+            const bool env = v.releasing || v.env < 1.0f;
+            bool done;
+            if (v.loop) done = tm ? renderPick<true, true>(env, v, out, numFrames, amp, pd, gTot, attackStep, rs, gm, gms)
+                                  : renderPick<true, false>(env, v, out, numFrames, amp, pd, gTot, attackStep, rs, gm, gms);
+            else        done = tm ? renderPick<false, true>(env, v, out, numFrames, amp, pd, gTot, attackStep, rs, gm, gms)
+                                  : renderPick<false, false>(env, v, out, numFrames, amp, pd, gTot, attackStep, rs, gm, gms);
             if (done) {
                 mVoices[vi] = std::move(mVoices.back());
                 mVoices.pop_back();
@@ -1053,6 +1193,9 @@ private:
     std::array<float, kMaxTrem> mTremLevel{};     // audio thread lang
     std::vector<float> mTremBuf;                  // [slot*2] = amp, [slot*2+1] = pitch
     uint32_t mTremActive = 0;
+    std::vector<float> mMaskBuf;                  // combined curves per tremulant combination
+    uint32_t mMaskKey[kMaxMasks + 1] = {};
+    int mMaskCount = 0;
 
     // swell / expression groups
     std::array<std::atomic<float>, kMaxGroups> mGroupGain{};
@@ -1077,6 +1220,9 @@ private:
     std::atomic<float> mPeak{0.0f};
     std::atomic<int> mVoicePeak{0};
     std::atomic<int> mDropped{0};
+    std::atomic<int> mStolen{0};
+    std::atomic<float> mLoadAvg{0.0f};
+    std::atomic<float> mLoadMax{0.0f};
 
     // impulse response
     Fft mFft;
@@ -1113,6 +1259,7 @@ private:
     std::vector<Cmd> mPending;
     std::vector<Cmd> mLocal;      // audio thread lang
     std::vector<Voice> mVoices;   // audio thread lang
+    std::vector<int> mVictims;    // audio thread lang
 };
 
 static std::shared_ptr<OrganEngine> gEngine;
